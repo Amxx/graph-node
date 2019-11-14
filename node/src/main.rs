@@ -1,5 +1,7 @@
+use ::futures::channel::mpsc;
+use ::futures::sink::SinkExt;
+use ::futures::stream::StreamExt;
 use clap::{App, Arg};
-use futures::sync::mpsc;
 use git_testament::{git_testament, render_testament};
 use ipfs_api::IpfsClient;
 use lazy_static::lazy_static;
@@ -28,8 +30,6 @@ use graph_server_metrics::PrometheusMetricsServer;
 use graph_server_websocket::SubscriptionServer as GraphQLSubscriptionServer;
 use graph_store_postgres::connection_pool::create_connection_pool;
 use graph_store_postgres::{Store as DieselStore, StoreConfig};
-
-use tokio_timer::timer::Timer;
 
 lazy_static! {
     // Default to an Ethereum reorg threshold to 50 blocks
@@ -74,7 +74,7 @@ fn main() {
     let handler_runtime = runtime.clone();
     *runtime.lock().unwrap() = Some(
         runtime::Builder::new()
-            .core_threads(*TOKIO_THREAD_COUNT)
+            .num_threads(*TOKIO_THREAD_COUNT)
             .panic_handler(move |_| {
                 let runtime = handler_runtime.clone();
                 std::thread::spawn(move || {
@@ -85,10 +85,7 @@ fn main() {
                             std::thread::sleep(Duration::from_millis(3000));
                             std::process::exit(1);
                         });
-                        runtime
-                            .shutdown_now()
-                            .wait()
-                            .expect("Failed to shutdown Tokio Runtime");
+                        drop(runtime);
                         println!("Runtime cleaned up and shutdown successfully");
                     }
                 });
@@ -98,22 +95,21 @@ fn main() {
     );
 
     let mut executor = runtime.lock().unwrap().as_ref().unwrap().executor();
-    let mut enter = tokio_executor::enter()
-        .expect("Failed to enter runtime executor, multiple executors at once");
-    let timer = Timer::default();
+    // let mut enter = tokio_executor::enter()
+    //     .expect("Failed to enter runtime executor, multiple executors at once");
+    let timer = tokio_timer::Timer::default();
     let timer_handle = timer.handle();
 
     // Setup runtime context with defaults and run the main application
-    tokio_executor::with_default(&mut executor, &mut enter, |enter| {
-        tokio_timer::with_default(&timer_handle, enter, |enter| {
-            enter
-                .block_on(future::lazy(|| async_main()))
-                .expect("Failed to run main function");
-        })
-    });
+    tokio_executor::with_default(&mut executor, || {
+        std::mem::forget(tokio_timer::set_default(&timer_handle));
+        tokio_executor::enter()
+            .unwrap()
+            .block_on(async { async_main() });
+    })
 }
 
-fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
+fn async_main() -> impl Future<Item = (), Error = ()> {
     env_logger::init();
     // Setup CLI using Clap, provide general info and capture postgres url
     let matches = App::new("graph-node")
@@ -435,7 +431,9 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
                     "Successfully connected to IPFS node at: {}",
                     SafeDisplay(ipfs_address_for_ok)
                 );
-            }),
+            })
+            .compat()
+            .map(|_| ()),
     );
 
     // Convert the client into a link resolver
@@ -491,17 +489,19 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
     let stores_logger = logger.clone();
     let stores_error_logger = logger.clone();
     let stores_eth_adapters = eth_adapters.clone();
-    futures::stream::futures_ordered(stores_eth_adapters.into_iter().map(
-        |(network_name, eth_adapter)| {
-            info!(
-                logger, "Connecting to Ethereum...";
-                "network" => &network_name,
-            );
-            eth_adapter
-                .net_identifiers(&logger)
-                .map(|network_identifier| (network_name, network_identifier))
-        },
-    ))
+    stream::futures_ordered(
+        stores_eth_adapters
+            .into_iter()
+            .map(|(network_name, eth_adapter)| {
+                info!(
+                    logger, "Connecting to Ethereum...";
+                    "network" => &network_name,
+                );
+                eth_adapter
+                    .net_identifiers(&logger)
+                    .map(|network_identifier| (network_name, network_identifier))
+            }),
+    )
     .map_err(move |e| {
         error!(stores_error_logger, "Was a valid Ethereum node provided?");
         panic!("Failed to connect to Ethereum node: {}", e);
@@ -574,7 +574,7 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
                 .expect("failed to create Ethereum block ingestor");
 
                 // Run the Ethereum block ingestor in the background
-                tokio::spawn(block_ingestor.into_polling_stream());
+                tokio::spawn(block_ingestor.into_polling_stream().compat().map(|_| ()));
             });
         }
 
@@ -610,7 +610,12 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
         );
 
         // Forward subgraph events from the subgraph provider to the subgraph instance manager
-        tokio::spawn(forward(&mut subgraph_provider, &subgraph_instance_manager).unwrap());
+        tokio::spawn(
+            forward(&mut subgraph_provider, &subgraph_instance_manager)
+                .unwrap()
+                .compat()
+                .map(|_| ()),
+        );
 
         // Check version switching mode environment variable
         let version_switching_mode = SubgraphVersionSwitchingMode::parse(
@@ -631,9 +636,15 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
             node_id.clone(),
             version_switching_mode,
         ));
-        tokio::spawn(subgraph_registrar.start().then(|start_result| {
-            Ok(start_result.expect("failed to initialize subgraph provider"))
-        }));
+        tokio::spawn(
+            subgraph_registrar
+                .start()
+                .then(|start_result| {
+                    Ok(start_result.expect("failed to initialize subgraph provider"))
+                })
+                .compat()
+                .map(|_| ()),
+        );
 
         // Start admin JSON-RPC server.
         let json_rpc_server = JsonRpcServer::serve(
@@ -674,7 +685,9 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
                     })
                     .then(|result| {
                         Ok(result.expect("Failed to deploy subgraph from `--subgraph` flag"))
-                    }),
+                    })
+                    .compat()
+                    .map(|_| ()),
             );
         }
 
@@ -682,42 +695,51 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
         tokio::spawn(
             graphql_server
                 .serve(http_port, ws_port)
-                .expect("Failed to start GraphQL query server"),
+                .expect("Failed to start GraphQL query server")
+                .compat()
+                .map(|_| ()),
         );
 
         // Serve GraphQL subscriptions over WebSockets
         tokio::spawn(
             subscription_server
                 .serve(ws_port)
-                .expect("Failed to start GraphQL subscription server"),
+                .expect("Failed to start GraphQL subscription server")
+                .compat()
+                .map(|_| ()),
         );
 
         // Run the index node server
         tokio::spawn(
             index_node_server
                 .serve(index_node_port)
-                .expect("Failed to start index node server"),
+                .expect("Failed to start index node server")
+                .compat()
+                .map(|_| ()),
         );
 
         tokio::spawn(
             metrics_server
                 .serve(metrics_port)
-                .expect("Failed to start metrics server"),
+                .expect("Failed to start metrics server")
+                .compat()
+                .map(|_| ()),
         );
 
         // Periodically check for contention in the tokio threadpool. First spawn a
         // task that simply responds to "ping" requests. Then spawn a separate
         // thread to periodically ping it and check responsiveness.
         let (ping_send, ping_receive) = mpsc::channel::<crossbeam_channel::Sender<()>>(1);
-        tokio::spawn(
-            ping_receive
-                .for_each(move |pong_send| pong_send.clone().send(()).map(|_| ()).map_err(|_| ())),
-        );
+        tokio::spawn(ping_receive.for_each(move |pong_send| {
+            async move {
+                pong_send.clone().send(()).ok();
+            }
+        }));
         let contention_logger = logger.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(1));
             let (pong_send, pong_receive) = crossbeam_channel::bounded(1);
-            if ping_send.clone().send(pong_send).wait().is_err() {
+            if ping_send.clone().send(pong_send).compat().wait().is_err() {
                 debug!(contention_logger, "Shutting down contention checker thread");
                 break;
             }

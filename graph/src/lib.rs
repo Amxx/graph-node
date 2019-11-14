@@ -24,6 +24,13 @@ pub mod prelude {
     pub use bigdecimal;
     pub use ethabi;
     pub use failure::{self, bail, err_msg, format_err, Error, Fail, SyncFailure};
+    pub use futures::future;
+    pub use futures::prelude::*;
+    pub use futures::stream;
+    pub use futures03;
+    pub use futures03::compat::{Future01CompatExt, Sink01CompatExt, Stream01CompatExt};
+    pub use futures03::future::{FutureExt as _, TryFutureExt as _};
+    pub use futures03::stream::{StreamExt as _, TryStreamExt as _};
     pub use hex;
     pub use serde_derive::{Deserialize, Serialize};
     pub use serde_json;
@@ -33,7 +40,7 @@ pub mod prelude {
     pub use std::sync::Arc;
     pub use tiny_keccak;
     pub use tokio;
-    pub use tokio::prelude::*;
+    pub use tokio::future::FutureExt as _;
     pub use tokio_executor;
     pub use tokio_timer;
     pub use web3;
@@ -106,5 +113,5 @@ pub mod prelude {
         ComponentLoggerConfig, ElasticComponentLoggerConfig, LoggerFactory,
     };
     pub use crate::log::split::split_logger;
-    pub use crate::util::futures::retry;
+    pub use crate::util::futures::{retry, TimeoutError};
 }

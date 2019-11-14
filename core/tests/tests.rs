@@ -19,7 +19,7 @@ use graph::prelude::*;
 use graph_core::LinkResolver;
 use graph_mock::{MockEthereumAdapter, MockStore};
 
-use crate::tokio::timer::Delay;
+use crate::tokio::time::Delay;
 
 /// Adds subgraph located in `test/subgraphs/`, replacing "link to" placeholders
 /// in the subgraph manifest with links to files just added into a local IPFS

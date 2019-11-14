@@ -112,25 +112,33 @@ where
         // Deploy named subgraphs found in store
         self.start_assigned_subgraphs().and_then(move |()| {
             // Spawn a task to handle assignment events
-            tokio::spawn(future::lazy(move || {
-                assignment_event_stream
-                    .map_err(SubgraphAssignmentProviderError::Unknown)
-                    .map_err(CancelableError::Error)
-                    .cancelable(&assignment_event_stream_cancel_handle, || {
-                        CancelableError::Cancel
-                    })
-                    .for_each(move |assignment_event| {
-                        assert_eq!(assignment_event.node_id(), &node_id);
-                        handle_assignment_event(assignment_event, provider.clone(), &logger_clone1)
-                    })
-                    .map_err(move |e| match e {
-                        CancelableError::Cancel => panic!("assignment event stream canceled"),
-                        CancelableError::Error(e) => {
-                            error!(logger_clone2, "Assignment event stream failed: {}", e);
-                            panic!("assignment event stream failed: {}", e);
-                        }
-                    })
-            }));
+            tokio::spawn(
+                future::lazy(move || {
+                    assignment_event_stream
+                        .map_err(SubgraphAssignmentProviderError::Unknown)
+                        .map_err(CancelableError::Error)
+                        .cancelable(&assignment_event_stream_cancel_handle, || {
+                            CancelableError::Cancel
+                        })
+                        .for_each(move |assignment_event| {
+                            assert_eq!(assignment_event.node_id(), &node_id);
+                            handle_assignment_event(
+                                assignment_event,
+                                provider.clone(),
+                                &logger_clone1,
+                            )
+                        })
+                        .map_err(move |e| match e {
+                            CancelableError::Cancel => panic!("assignment event stream canceled"),
+                            CancelableError::Error(e) => {
+                                error!(logger_clone2, "Assignment event stream failed: {}", e);
+                                panic!("assignment event stream failed: {}", e);
+                            }
+                        })
+                })
+                .compat()
+                .map(|_| ()),
+            );
 
             Ok(())
         })
@@ -249,18 +257,18 @@ where
                 // started. We wait for the spawned tasks to complete by giving
                 // each a `sender` and waiting for all of them to be dropped, so
                 // the receiver terminates without receiving anything.
-                let (sender, receiver) = tokio::sync::mpsc::channel::<()>(1);
+                let (sender, receiver) = futures::sync::mpsc::channel::<()>(1);
                 for id in subgraph_ids {
                     let sender = sender.clone();
-                    tokio::spawn(
-                        graph::util::futures::blocking(start_subgraph(
-                            id,
-                            &*provider,
-                            logger.clone(),
-                        ))
-                        .map(move |()| drop(sender))
-                        .map_err(|()| unreachable!()),
-                    );
+                    let provider = provider.clone();
+                    let logger = logger.clone();
+                    tokio::blocking::spawn_blocking(move || {
+                        start_subgraph(id, &*provider, logger)
+                            .map(move |()| drop(sender))
+                            .map_err(|()| unreachable!())
+                            .compat()
+                            .map(|_| ())
+                    });
                 }
                 drop(sender);
                 receiver.collect().then(move |_| {

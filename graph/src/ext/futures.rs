@@ -1,8 +1,9 @@
 use failure::Error;
+use futures::future::Fuse;
+use futures::prelude::{Future, Poll, Stream};
 use futures::sync::oneshot;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
-use tokio::prelude::{future::Fuse, Future, Poll, Stream};
 
 /// A cancelable stream or future.
 ///

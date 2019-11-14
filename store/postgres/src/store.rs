@@ -16,7 +16,7 @@ use graph::data::subgraph::schema::*;
 use graph::prelude::serde_json;
 use graph::prelude::{ChainHeadUpdateListener as _, *};
 use graph_graphql::prelude::api_schema;
-use tokio::timer::Interval;
+use tokio::time::Interval;
 use web3::types::H256;
 
 use crate::block_range::BLOCK_NUMBER_MAX;
@@ -266,40 +266,47 @@ impl Store {
         let logger = self.logger.clone();
         let subscriptions = self.subscriptions.clone();
 
-        tokio::spawn(store_events.for_each(move |event| {
-            let senders = subscriptions.read().unwrap().clone();
-            let logger = logger.clone();
-            let subscriptions = subscriptions.clone();
+        tokio::spawn(
+            store_events
+                .for_each(move |event| {
+                    let senders = subscriptions.read().unwrap().clone();
+                    let logger = logger.clone();
+                    let subscriptions = subscriptions.clone();
 
-            // Write change to all matching subscription streams; remove subscriptions
-            // whose receiving end has been dropped
-            stream::iter_ok::<_, ()>(senders).for_each(move |(id, sender)| {
-                let logger = logger.clone();
-                let subscriptions = subscriptions.clone();
+                    // Write change to all matching subscription streams; remove subscriptions
+                    // whose receiving end has been dropped
+                    stream::iter_ok::<_, ()>(senders).for_each(move |(id, sender)| {
+                        let logger = logger.clone();
+                        let subscriptions = subscriptions.clone();
 
-                sender.send(event.clone()).then(move |result| {
-                    match result {
-                        Err(_send_error) => {
-                            // Receiver was dropped
-                            debug!(logger, "Unsubscribe"; "id" => &id);
-                            subscriptions.write().unwrap().remove(&id);
-                            Ok(())
-                        }
-                        Ok(_sender) => Ok(()),
-                    }
+                        sender.send(event.clone()).then(move |result| {
+                            match result {
+                                Err(_send_error) => {
+                                    // Receiver was dropped
+                                    debug!(logger, "Unsubscribe"; "id" => &id);
+                                    subscriptions.write().unwrap().remove(&id);
+                                    Ok(())
+                                }
+                                Ok(_sender) => Ok(()),
+                            }
+                        })
+                    })
                 })
-            })
-        }));
+                .compat()
+                .map(|_| ()),
+        );
     }
 
     fn periodically_clean_up_stale_subscriptions(&self) {
+        use futures03::stream::StreamExt;
+
         let logger = self.logger.clone();
         let subscriptions = self.subscriptions.clone();
 
         // Clean up stale subscriptions every 5s
         tokio::spawn(
-            Interval::new(Instant::now(), Duration::from_secs(5))
-                .for_each(move |_| {
+            Interval::new(tokio::time::Instant::now(), Duration::from_secs(5)).for_each(
+                move |_| {
                     let mut subscriptions = subscriptions.write().unwrap();
 
                     // Obtain IDs of subscriptions whose receiving end has gone
@@ -317,9 +324,9 @@ impl Store {
                         subscriptions.remove(&id);
                     }
 
-                    Ok(())
-                })
-                .map_err(|_| unreachable!()),
+                    futures03::future::ready(())
+                },
+            ),
         );
     }
 

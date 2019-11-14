@@ -301,13 +301,17 @@ impl Store for MockStore {
                     let entity_change = entity_change.clone();
                     let sender = sender.clone();
 
-                    tokio::spawn(future::lazy(move || {
-                        let event = StoreEvent::new(vec![entity_change]);
-                        sender
-                            .send(event)
-                            .map(|_| ())
-                            .map_err(|e| panic!("subscription send error: {}", e))
-                    }));
+                    tokio::spawn(
+                        future::lazy(move || {
+                            let event = StoreEvent::new(vec![entity_change]);
+                            sender
+                                .send(event)
+                                .map(|_| ())
+                                .map_err(|e| panic!("subscription send error: {}", e))
+                        })
+                        .compat()
+                        .map(|_| ()),
+                    );
                 }
             }
         }

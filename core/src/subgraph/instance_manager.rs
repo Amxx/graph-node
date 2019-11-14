@@ -221,75 +221,80 @@ impl SubgraphInstanceManager {
         // Subgraph instance shutdown senders
         let instances: SharedInstanceKeepAliveMap = Default::default();
 
-        tokio::spawn(receiver.for_each(move |event| {
-            use self::SubgraphAssignmentProviderEvent::*;
+        tokio::spawn(
+            receiver
+                .compat()
+                .try_for_each(move |event| {
+                    use self::SubgraphAssignmentProviderEvent::*;
 
-            match event {
-                SubgraphStart(manifest) => {
-                    let logger = logger_factory.subgraph_logger(&manifest.id);
-                    info!(
-                        logger,
-                        "Start subgraph";
-                        "data_sources" => manifest.data_sources.len()
-                    );
+                    match event {
+                        SubgraphStart(manifest) => {
+                            let logger = logger_factory.subgraph_logger(&manifest.id);
+                            info!(
+                                logger,
+                                "Start subgraph";
+                                "data_sources" => manifest.data_sources.len()
+                            );
 
-                    match manifest.network_name() {
-                        Ok(n) => {
-                            Self::start_subgraph(
-                                logger.clone(),
-                                instances.clone(),
-                                host_builder.clone(),
-                                block_stream_builder.clone(),
-                                stores
-                                    .get(&n)
-                                    .expect(&format!(
-                                        "expected store that matches subgraph network: {}",
-                                        &n
-                                    ))
-                                    .clone(),
-                                eth_adapters
-                                    .get(&n)
-                                    .expect(&format!(
+                            match manifest.network_name() {
+                                Ok(n) => {
+                                    Self::start_subgraph(
+                                        logger.clone(),
+                                        instances.clone(),
+                                        host_builder.clone(),
+                                        block_stream_builder.clone(),
+                                        stores
+                                            .get(&n)
+                                            .expect(&format!(
+                                                "expected store that matches subgraph network: {}",
+                                                &n
+                                            ))
+                                            .clone(),
+                                        eth_adapters
+                                            .get(&n)
+                                            .expect(&format!(
                                         "expected eth adapter that matches subgraph network: {}",
                                         &n
                                     ))
-                                    .clone(),
-                                manifest,
-                                metrics_registry_for_subgraph.clone(),
-                            )
-                            .map_err(|err| {
-                                error!(
+                                            .clone(),
+                                        manifest,
+                                        metrics_registry_for_subgraph.clone(),
+                                    )
+                                    .map_err(|err| {
+                                        error!(
+                                            logger,
+                                            "Failed to start subgraph";
+                                            "error" => format!("{}", err),
+                                            "code" => LogCode::SubgraphStartFailure
+                                        )
+                                    })
+                                    .and_then(|_| {
+                                        manager_metrics.subgraph_count.inc();
+                                        Ok(())
+                                    })
+                                    .ok();
+                                }
+                                Err(err) => error!(
                                     logger,
                                     "Failed to start subgraph";
-                                    "error" => format!("{}", err),
+                                     "error" => format!("{}", err),
                                     "code" => LogCode::SubgraphStartFailure
-                                )
-                            })
-                            .and_then(|_| {
-                                manager_metrics.subgraph_count.inc();
-                                Ok(())
-                            })
-                            .ok();
+                                ),
+                            };
                         }
-                        Err(err) => error!(
-                            logger,
-                            "Failed to start subgraph";
-                             "error" => format!("{}", err),
-                            "code" => LogCode::SubgraphStartFailure
-                        ),
+                        SubgraphStop(id) => {
+                            let logger = logger_factory.subgraph_logger(&id);
+                            info!(logger, "Stop subgraph");
+
+                            Self::stop_subgraph(instances.clone(), id);
+                            manager_metrics.subgraph_count.dec();
+                        }
                     };
-                }
-                SubgraphStop(id) => {
-                    let logger = logger_factory.subgraph_logger(&id);
-                    info!(logger, "Stop subgraph");
 
-                    Self::stop_subgraph(instances.clone(), id);
-                    manager_metrics.subgraph_count.dec();
-                }
-            };
-
-            Ok(())
-        }));
+                    futures03::future::ok(())
+                })
+                .map(|_| ()),
+        );
     }
 
     fn start_subgraph<B, S, M>(
@@ -402,14 +407,11 @@ impl SubgraphInstanceManager {
         // forward; this is easier than updating the existing block stream.
         //
         // This task has many calls to the store, so mark it as `blocking`.
-        let subgraph_runner =
-            graph::util::futures::blocking(loop_fn(ctx, move |ctx| run_subgraph(ctx))).then(
-                move |res| {
-                    subgraph_metrics_unregister.unregister(registry);
-                    future::result(res)
-                },
-            );
-        tokio::spawn(subgraph_runner);
+        let subgraph_runner = loop_fn(ctx, move |ctx| run_subgraph(ctx)).then(move |res| {
+            subgraph_metrics_unregister.unregister(registry);
+            future::result(res)
+        });
+        tokio::blocking::spawn_blocking(move || subgraph_runner.compat().map(|_| ()));
 
         Ok(())
     }
