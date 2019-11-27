@@ -5,6 +5,7 @@ use graphql_parser::schema;
 use serde::de;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::convert::TryFrom;
 use std::fmt;
 use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut};
@@ -203,6 +204,13 @@ impl Value {
         }
     }
 
+    pub fn is_string(&self) -> bool {
+        match self {
+            Value::String(_) => true,
+            _ => false,
+        }
+    }
+
     pub fn as_int(self) -> Option<i32> {
         if let Value::Int(i) = self {
             Some(i)
@@ -250,6 +258,26 @@ impl Value {
             None
         }
     }
+
+    /// Return the name of the type of this value for display to the user
+    pub fn type_name(&self) -> String {
+        match self {
+            Value::BigDecimal(_) => "BigDecimal".to_owned(),
+            Value::BigInt(_) => "BigInt".to_owned(),
+            Value::Bool(_) => "Boolean".to_owned(),
+            Value::Bytes(_) => "Bytes".to_owned(),
+            Value::Int(_) => "Int".to_owned(),
+            Value::List(values) => {
+                if let Some(v) = values.first() {
+                    format!("[{}]", v.type_name())
+                } else {
+                    "[Any]".to_owned()
+                }
+            }
+            Value::Null => "Null".to_owned(),
+            Value::String(_) => "String".to_owned(),
+        }
+    }
 }
 
 impl fmt::Display for Value {
@@ -263,10 +291,14 @@ impl fmt::Display for Value {
                 Value::BigDecimal(d) => d.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Null => "null".to_string(),
-                Value::List(ref values) => values
-                    .into_iter()
-                    .map(|value| format!("{}", value))
-                    .collect(),
+                Value::List(ref values) => format!(
+                    "[{}]",
+                    values
+                        .into_iter()
+                        .map(|value| format!("{}", value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
                 Value::Bytes(ref bytes) => bytes.to_string(),
                 Value::BigInt(ref number) => number.to_string(),
             }
@@ -327,6 +359,12 @@ impl From<scalar::BigDecimal> for Value {
     }
 }
 
+impl From<scalar::BigInt> for Value {
+    fn from(value: scalar::BigInt) -> Value {
+        Value::BigInt(value)
+    }
+}
+
 impl From<u64> for Value {
     fn from(value: u64) -> Value {
         Value::BigInt(value.into())
@@ -348,6 +386,34 @@ impl From<Address> for Value {
 impl From<H256> for Value {
     fn from(hash: H256) -> Value {
         Value::Bytes(scalar::Bytes::from(hash.as_ref()))
+    }
+}
+
+impl TryFrom<Value> for Option<H256> {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Bytes(bytes) => {
+                let hex = format!("{}", bytes);
+                Ok(Some(H256::from_str(hex.trim_start_matches("0x"))?))
+            }
+            Value::String(s) => Ok(Some(H256::from_str(s.as_str())?)),
+            Value::Null => Ok(None),
+            _ => Err(format_err!("Value is not an H256")),
+        }
+    }
+}
+
+impl TryFrom<Value> for Option<scalar::BigInt> {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::BigInt(n) => Ok(Some(n.clone())),
+            Value::Null => Ok(None),
+            _ => Err(format_err!("Value is not an BigInt")),
+        }
     }
 }
 

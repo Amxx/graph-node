@@ -33,7 +33,7 @@ where
         skip: i32,
     ) -> Result<Query, Error> {
         // Obtain the "subgraphs" schema
-        let schema = self.store.subgraph_schema(&SUBGRAPHS_ID)?;
+        let schema = self.store.api_schema(&SUBGRAPHS_ID)?;
 
         // Construct a query for the subgraph deployment and all its
         // dynamic data sources
@@ -100,7 +100,7 @@ where
         let deployment_id1 = deployment_id.clone();
 
         self.graphql_runner
-            .run_query_with_complexity(query, None)
+            .run_query_with_complexity(query, None, None, None)
             .map_err(move |e| {
                 format_err!(
                     "Failed to query subgraph deployment `{}`: {}",

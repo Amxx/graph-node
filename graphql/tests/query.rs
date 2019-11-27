@@ -8,14 +8,12 @@ use std::time::{Duration, Instant};
 
 use graph::prelude::*;
 use graph_graphql::prelude::*;
-use test_store::STORE;
+use test_store::{transact_entity_operations, GENESIS_PTR, STORE};
 
 lazy_static! {
     static ref TEST_SUBGRAPH_ID: SubgraphDeploymentId = {
         // Also populate the store when the ID is first accessed.
         let id = SubgraphDeploymentId::new("graphqlTestsQuery").unwrap();
-        let logger = Logger::root(slog::Discard, o!());
-        STORE.create_subgraph_deployment(&logger, &id, vec![]).unwrap();
         insert_test_entities(&**STORE, id.clone());
         id
     };
@@ -65,6 +63,8 @@ fn api_test_schema() -> Schema {
 }
 
 fn insert_test_entities(store: &impl Store, id: SubgraphDeploymentId) {
+    let schema = test_schema(id.clone());
+
     // First insert the manifest.
     let manifest = SubgraphManifest {
         id: id.clone(),
@@ -72,18 +72,17 @@ fn insert_test_entities(store: &impl Store, id: SubgraphDeploymentId) {
         spec_version: "1".to_owned(),
         description: None,
         repository: None,
-        schema: test_schema(id.clone()),
+        schema: schema.clone(),
         data_sources: vec![],
         templates: vec![],
     };
 
-    store
-        .apply_entity_operations(
-            SubgraphDeploymentEntity::new(&manifest, false, false, Default::default(), 1)
-                .create_operations_replace(&id),
-            None,
-        )
-        .unwrap();
+    let ops = SubgraphDeploymentEntity::new(&manifest, false, false, None, None)
+        .create_operations_replace(&id)
+        .into_iter()
+        .map(|op| op.into())
+        .collect();
+    store.create_subgraph_deployment(&schema, ops).unwrap();
 
     let entities = vec![
         Entity::from(vec![
@@ -187,9 +186,13 @@ fn insert_test_entities(store: &impl Store, id: SubgraphDeploymentId) {
         data,
     });
 
-    store
-        .apply_entity_operations(insert_ops.collect(), None)
-        .unwrap();
+    transact_entity_operations(
+        &STORE,
+        id.clone(),
+        GENESIS_PTR.clone(),
+        insert_ops.collect::<Vec<_>>(),
+    )
+    .unwrap();
 }
 
 fn execute_query_document(query: q::Document) -> QueryResult {
@@ -215,6 +218,7 @@ fn execute_query_document_with_variables(
         deadline: None,
         max_complexity: None,
         max_depth: 100,
+        max_first: std::u32::MAX,
     };
 
     execute_query(&query, options)
@@ -708,6 +712,7 @@ fn query_complexity() {
         deadline: None,
         max_complexity,
         max_depth: 100,
+        max_first: std::u32::MAX,
     };
 
     // This query is exactly at the maximum complexity.
@@ -744,6 +749,7 @@ fn query_complexity() {
         deadline: None,
         max_complexity,
         max_depth: 100,
+        max_first: std::u32::MAX,
     };
 
     // The extra introspection causes the complexity to go over.
@@ -784,6 +790,7 @@ fn query_complexity_subscriptions() {
         timeout: None,
         max_complexity,
         max_depth: 100,
+        max_first: std::u32::MAX,
     };
 
     // This query is exactly at the maximum complexity.
@@ -819,6 +826,7 @@ fn query_complexity_subscriptions() {
         timeout: None,
         max_complexity,
         max_depth: 100,
+        max_first: std::u32::MAX,
     };
 
     // The extra introspection causes the complexity to go over.
@@ -848,6 +856,7 @@ fn instant_timeout() {
         deadline: Some(Instant::now()),
         max_complexity: None,
         max_depth: 100,
+        max_first: std::u32::MAX,
     };
 
     match execute_query(&query, options).errors.unwrap()[0] {
@@ -1152,6 +1161,7 @@ fn subscription_gets_result_even_without_events() {
         timeout: None,
         max_complexity: None,
         max_depth: 100,
+        max_first: std::u32::MAX,
     };
 
     // Execute the subscription and expect at least one result to be
@@ -1176,4 +1186,57 @@ fn subscription_gets_result_even_without_events() {
             ])
         )])),
     );
+}
+
+#[test]
+fn can_use_nested_filter() {
+    let result = execute_query_document(
+        graphql_parser::parse_query(
+            "
+        query {
+            musicians(orderBy: id) {
+                name
+                bands(where: { originalSongs: [\"s1\", \"s3\", \"s4\"] }) { id }
+            }
+        }
+        ",
+        )
+        .expect("invalid test query"),
+    );
+
+    assert_eq!(
+        result.data.unwrap(),
+        object_value(vec![(
+            "musicians",
+            q::Value::List(vec![
+                object_value(vec![
+                    ("name", q::Value::String(String::from("John"))),
+                    (
+                        "bands",
+                        q::Value::List(vec![object_value(vec![(
+                            "id",
+                            q::Value::String(String::from("b2"))
+                        )])])
+                    )
+                ]),
+                object_value(vec![
+                    ("name", q::Value::String(String::from("Lisa"))),
+                    ("bands", q::Value::List(vec![]))
+                ]),
+                object_value(vec![
+                    ("name", q::Value::String(String::from("Tom"))),
+                    (
+                        "bands",
+                        q::Value::List(vec![object_value(vec![
+                            (("id", q::Value::String(String::from("b2"))))
+                        ])])
+                    )
+                ]),
+                object_value(vec![
+                    ("name", q::Value::String(String::from("Valerie"))),
+                    ("bands", q::Value::List(vec![]))
+                ])
+            ])
+        )])
+    )
 }

@@ -203,7 +203,7 @@ where
             Ok(true) => (),
         }
 
-        let schema = match self.store.subgraph_schema(id) {
+        let schema = match self.store.api_schema(id) {
             Ok(schema) => schema,
             Err(e) => {
                 return Box::new(future::err(GraphQLServerError::InternalError(
@@ -428,6 +428,8 @@ mod tests {
             &self,
             _query: Query,
             _complexity: Option<u64>,
+            _max_depth: Option<u8>,
+            _max_first: Option<u32>,
         ) -> QueryResultFuture {
             unimplemented!();
         }
@@ -452,42 +454,38 @@ mod tests {
     #[test]
     fn posting_invalid_query_yields_error_response() {
         let logger = Logger::root(slog::Discard, o!());
-        let id = SubgraphDeploymentId::new("testschema").unwrap();
-        let schema = Schema::parse(
-            "\
-             scalar String \
-             type Query @entity { name: String } \
-             ",
-            id.clone(),
-        )
-        .unwrap();
+        let store = Arc::new(MockStore::user_store());
+        let id = MockStore::user_subgraph_id();
+        let schema = store
+            .input_schema(&id)
+            .expect("Failed to get schema")
+            .as_ref()
+            .clone();
         let manifest = SubgraphManifest {
             id: id.clone(),
             location: "".to_owned(),
             spec_version: "".to_owned(),
             description: None,
             repository: None,
-            schema: schema.clone(),
+            schema,
             data_sources: vec![],
             templates: vec![],
         };
 
         let graphql_runner = Arc::new(TestGraphQlRunner);
-        let store = Arc::new(MockStore::new(vec![(id.clone(), schema)]));
         store
-            .apply_entity_operations(
+            .apply_metadata_operations(
                 SubgraphDeploymentEntity::new(
                     &manifest,
                     false,
                     false,
-                    EthereumBlockPointer {
+                    None,
+                    Some(EthereumBlockPointer {
                         hash: H256::zero(),
                         number: 0,
-                    },
-                    0,
+                    }),
                 )
                 .create_operations(&id),
-                None,
             )
             .unwrap();
 
@@ -523,46 +521,42 @@ mod tests {
     #[test]
     fn posting_valid_queries_yields_result_response() {
         let logger = Logger::root(slog::Discard, o!());
-        let id = SubgraphDeploymentId::new("testschema").unwrap();
-        let schema = Schema::parse(
-            "\
-             scalar String \
-             type Query @entity { name: String } \
-             ",
-            id.clone(),
-        )
-        .unwrap();
+        let store = Arc::new(MockStore::user_store());
+        let id = MockStore::user_subgraph_id();
+        let schema = store
+            .input_schema(&id)
+            .expect("Failed to get schema")
+            .as_ref()
+            .clone();
         let manifest = SubgraphManifest {
             id: id.clone(),
             location: "".to_owned(),
             spec_version: "".to_owned(),
             description: None,
             repository: None,
-            schema: schema.clone(),
+            schema,
             data_sources: vec![],
             templates: vec![],
         };
         let graphql_runner = Arc::new(TestGraphQlRunner);
-        let store = Arc::new(MockStore::new(vec![(id.clone(), schema)]));
 
         let mut runtime = tokio::runtime::Runtime::new().unwrap();
         runtime
             .block_on(future::lazy(move || {
                 let res: Result<_, ()> = Ok({
                     store
-                        .apply_entity_operations(
+                        .apply_metadata_operations(
                             SubgraphDeploymentEntity::new(
                                 &manifest,
                                 false,
                                 false,
-                                EthereumBlockPointer {
+                                None,
+                                Some(EthereumBlockPointer {
                                     hash: H256::zero(),
                                     number: 0,
-                                },
-                                0,
+                                }),
                             )
                             .create_operations(&id),
-                            None,
                         )
                         .unwrap();
 

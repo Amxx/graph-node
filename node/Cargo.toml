@@ -1,33 +1,34 @@
 [package]
 name = "graph-node"
-version = "0.15.1"
+version = "0.16.1"
 edition = "2018"
 
 [dependencies]
-clap = "2.31.2"
+clap = "2.33.0"
 env_logger = "0.6.2"
 futures = "0.1.21"
 git-testament = "0.1"
-graphql-parser = "0.2.1"
+graphql-parser = "0.2.3"
 http = "0.1"
+prometheus = "0.7"
 
 # We're using the latest ipfs-api for the HTTPS support that was merged in
 # https://github.com/ferristseng/rust-ipfs-api/commit/55902e98d868dcce047863859caf596a629d10ec
 # but has not been released yet.
 ipfs-api = { git = "https://github.com/ferristseng/rust-ipfs-api", branch = "master", features = ["hyper-tls"] }
-itertools = "0.7"
 lazy_static = "1.2.0"
-sentry = "0.15.5"
 url = "1.7.1"
-crossbeam-channel = "0.3.8"
+crossbeam-channel = "0.3.9"
 graph = { path = "../graph" }
 graph-core = { path = "../core" }
-graph-datasource-ethereum = { path = "../datasource/ethereum" }
+graph-chain-ethereum = { path = "../chain/ethereum" }
 graph-mock = { path = "../mock" }
 graph-runtime-wasm = { path = "../runtime/wasm" }
 graph-server-http = { path = "../server/http" }
+graph-server-index-node = { path = "../server/index-node" }
 graph-server-json-rpc = { path = "../server/json-rpc"}
 graph-server-websocket = { path = "../server/websocket" }
+graph-server-metrics = { path = "../server/metrics" }
 graph-store-postgres = { path = "../store/postgres" }
 
 [dev-dependencies]

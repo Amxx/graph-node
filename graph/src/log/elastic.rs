@@ -8,7 +8,6 @@ use std::time::Duration;
 use chrono::prelude::{SecondsFormat, Utc};
 use futures::future;
 use futures::{Future, Stream};
-use itertools;
 use reqwest;
 use reqwest::r#async::Client;
 use serde::ser::Serializer as SerdeSerializer;
@@ -112,7 +111,11 @@ impl SimpleKVSerializer {
     fn finish(self) -> (usize, String) {
         (
             self.kvs.len(),
-            itertools::join(self.kvs.iter().map(|(k, v)| format!("{}: {}", k, v)), ", "),
+            self.kvs
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect::<Vec<_>>()
+                .join(", "),
         )
     }
 }
@@ -153,7 +156,7 @@ pub struct ElasticDrainConfig {
 ///     "timestamp": "2018-11-08T00:54:52.589258000Z",
 ///     "subgraphId": "Qmb31zcpzqga7ERaUTp83gVdYcuBasz4rXUHFufikFTJGU",
 ///     "meta": {
-///       "module": "graph_datasource_ethereum::block_stream",
+///       "module": "graph_chain_ethereum::block_stream",
 ///       "line": 220,
 ///       "column": 9
 ///     },
@@ -368,7 +371,7 @@ impl Drain for ElasticDrain {
 pub fn elastic_logger(config: ElasticDrainConfig, error_logger: Logger) -> Logger {
     let elastic_drain = ElasticDrain::new(config, error_logger).fuse();
     let async_drain = slog_async::Async::new(elastic_drain)
-        .chan_size(1000)
+        .chan_size(10000)
         .build()
         .fuse();
     Logger::root(async_drain, o!())

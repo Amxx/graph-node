@@ -245,6 +245,8 @@ pub enum SubgraphRegistrarError {
     StoreError(StoreError),
     #[fail(display = "subgraph validation error: {:?}", _0)]
     ManifestValidationError(Vec<SubgraphManifestValidationError>),
+    #[fail(display = "subgraph deployment error: {}", _0)]
+    SubgraphDeploymentError(StoreError),
     #[fail(display = "subgraph registrar error: {}", _0)]
     Unknown(failure::Error),
 }
@@ -319,6 +321,8 @@ pub enum SubgraphAssignmentProviderEvent {
 
 #[derive(Fail, Debug)]
 pub enum SubgraphManifestValidationError {
+    #[fail(display = "subgraph has no data sources")]
+    NoDataSources,
     #[fail(display = "subgraph source address is required")]
     SourceAddressRequired,
     #[fail(display = "subgraph cannot index data from different Ethereum networks")]
@@ -327,6 +331,8 @@ pub enum SubgraphManifestValidationError {
     EthereumNetworkRequired,
     #[fail(display = "subgraph data source has too many similar block handlers")]
     DataSourceBlockHandlerLimitExceeded,
+    #[fail(display = "the specified block must exist on the Ethereum network")]
+    BlockNotFound(String),
 }
 
 #[derive(Fail, Debug)]
@@ -385,6 +391,8 @@ pub struct Source {
     #[serde(default, deserialize_with = "deserialize_address")]
     pub address: Option<Address>,
     pub abi: String,
+    #[serde(rename = "startBlock", default)]
+    pub start_block: u64,
 }
 
 impl From<EthereumContractSourceEntity> for Source {
@@ -392,6 +400,7 @@ impl From<EthereumContractSourceEntity> for Source {
         Self {
             address: entity.address,
             abi: entity.abi,
+            start_block: entity.start_block,
         }
     }
 }
@@ -639,8 +648,7 @@ impl UnresolvedDataSource {
             templates,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name);
-
+        info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
         mapping
             .resolve(resolver, logger.clone())
             .join(
@@ -693,6 +701,7 @@ impl DataSource {
             source: Source {
                 address: Some(address),
                 abi: template.source.abi,
+                start_block: 0,
             },
             mapping: template.mapping,
             templates: Vec::new(),
@@ -873,6 +882,13 @@ impl SubgraphManifest {
             },
             _ => Err(SubgraphManifestValidationError::MultipleEthereumNetworks),
         }
+    }
+
+    pub fn start_blocks(&self) -> Vec<u64> {
+        self.data_sources
+            .iter()
+            .map(|data_source| data_source.source.start_block)
+            .collect()
     }
 }
 

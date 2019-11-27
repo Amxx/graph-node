@@ -32,19 +32,18 @@ those.
   request (defaults to 10000).
 - `ETHEREUM_PARALLEL_BLOCK_RANGES`: Maximum number of parallel `eth_getLogs`
   calls to make when scanning logs for a subgraph. Defaults to 100.
-- `ETHEREUM_START_BLOCK`: the block number at which subgraphs should start
-  indexing (defaults to the genesis block). Can save some time while debugging
-  subgraphs locally. _Warning:_ Do not use this in production, as it may
-  cause subgraphs to be only indexed partially.
 - `GRAPH_ETHEREUM_MAX_EVENT_ONLY_RANGE`: Maximum range size for `eth.getLogs`
   requests that dont filter on contract address, only event signature.
+- `GRAPH_ETHEREUM_JSON_RPC_TIMEOUT`: Timeout for Ethereum JSON-RPC requests.
 
 ## Running mapping handlers
 
 - `GRAPH_MAPPING_HANDLER_TIMEOUT`: amount of time a mapping handler is allowed to
   take (in seconds, default is unlimited)
-- `GRAPH_IPFS_TIMEOUT`: timeout for ipfs requests. In seconds, default is 60.
-  seconds.
+- `GRAPH_IPFS_SUBGRAPH_LOADING_TIMEOUT`: timeout for IPFS requests made to load
+  subgraph files from IPFS (in seconds, default is 60).
+- `GRAPH_IPFS_TIMEOUT`: timeout for IPFS requests from mappings using `ipfs.cat`
+  or `ipfs.map` (in seconds, default is 60).
 - `GRAPH_MAX_IPFS_FILE_BYTES`: maximum size for a file that can be retrieved
   with `ipfs.cat` (in bytes, default is unlimited)
 - `GRAPH_MAX_IPFS_MAP_FILE_SIZE`: maximum size of files that can be processed
@@ -70,6 +69,12 @@ those.
   with introspection done by graphql clients.
 - `GRAPH_GRAPHQL_MAX_DEPTH`: maximum depth of a graphql query. Default (and
   maximum) is 255.
+- `GRAPH_GRAPHQL_MAX_FIRST`: maximum value that can be used for the `first`
+  argument in GraphQL queries. If not provided, `first` defaults to 100. The
+  default value for `GRAPH_GRAPHQL_MAX_FIRST` is 1000.
+- `GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION`: maximum number of GraphQL
+  operations per WebSocket connection. Any operation created after the limit
+  will return an error to the client. Default: unlimited.
 
 ## Tokio
 
@@ -82,6 +87,5 @@ those.
   of nodes.
 - `GRAPH_LOG`: control log levels, the same way that `RUST_LOG` is described
   [here](https://docs.rs/env_logger/0.6.0/env_logger/)
-- `THEGRAPH_SENTRY_URL`:
 - `THEGRAPH_STORE_POSTGRES_DIESEL_URL`: postgres instance used when running
   tests. Set to `postgresql://<DBUSER>:<DBPASSWORD>@<DBHOST>:<DBPORT>/<DBNAME>`

@@ -21,6 +21,7 @@ pub mod log;
 /// use graph::prelude::*;
 /// ```
 pub mod prelude {
+    pub use bigdecimal;
     pub use ethabi;
     pub use failure::{self, bail, err_msg, format_err, Error, Fail, SyncFailure};
     pub use hex;
@@ -30,6 +31,7 @@ pub mod prelude {
     pub use std::fmt::Debug;
     pub use std::iter::FromIterator;
     pub use std::sync::Arc;
+    pub use tiny_keccak;
     pub use tokio;
     pub use tokio::prelude::*;
     pub use tokio_executor;
@@ -37,30 +39,39 @@ pub mod prelude {
     pub use web3;
 
     pub use crate::components::ethereum::{
-        BlockStream, BlockStreamBuilder, ChainHeadUpdate, ChainHeadUpdateListener,
-        ChainHeadUpdateStream, EthereumAdapter, EthereumAdapterError, EthereumBlock,
-        EthereumBlockData, EthereumBlockFilter, EthereumBlockPointer, EthereumBlockTriggerType,
-        EthereumBlockWithCalls, EthereumBlockWithTriggers, EthereumCall, EthereumCallData,
-        EthereumCallFilter, EthereumContractCall, EthereumContractCallError, EthereumEventData,
-        EthereumLogFilter, EthereumNetworkIdentifier, EthereumTransactionData, EthereumTrigger,
+        BlockFinality, BlockStream, BlockStreamBuilder, BlockStreamMetrics, ChainHeadUpdate,
+        ChainHeadUpdateListener, ChainHeadUpdateStream, EthereumAdapter, EthereumAdapterError,
+        EthereumBlock, EthereumBlockData, EthereumBlockFilter, EthereumBlockPointer,
+        EthereumBlockTriggerType, EthereumBlockWithCalls, EthereumBlockWithTriggers, EthereumCall,
+        EthereumCallData, EthereumCallFilter, EthereumContractCall, EthereumContractCallError,
+        EthereumEventData, EthereumLogFilter, EthereumNetworkIdentifier, EthereumTransactionData,
+        EthereumTrigger, LightEthereumBlock, LightEthereumBlockExt, ProviderEthRpcMetrics,
+        SubgraphEthRpcMetrics,
     };
     pub use crate::components::graphql::{
         GraphQlRunner, QueryResultFuture, SubscriptionResultFuture,
     };
     pub use crate::components::link_resolver::{JsonStreamValue, JsonValueStream, LinkResolver};
+    pub use crate::components::metrics::{
+        stopwatch::StopwatchMetrics, Collector, Counter, CounterVec, Gauge, GaugeVec, Histogram,
+        HistogramOpts, HistogramVec, MetricsRegistry, Opts, PrometheusError, Registry,
+    };
     pub use crate::components::server::admin::JsonRpcServer;
+    pub use crate::components::server::index_node::IndexNodeServer;
+    pub use crate::components::server::metrics::MetricsServer;
     pub use crate::components::server::query::GraphQLServer;
     pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
-        AttributeIndexDefinition, ChainStore, EntityChange, EntityChangeOperation, EntityFilter,
-        EntityKey, EntityOperation, EntityOrder, EntityQuery, EntityRange, EventSource,
-        HistoryEvent, Store, StoreError, StoreEvent, StoreEventStream, StoreEventStreamBox,
-        SubgraphDeploymentStore, TransactionAbortError, SUBSCRIPTION_THROTTLE_INTERVAL,
+        AttributeIndexDefinition, ChainStore, EntityCache, EntityChange, EntityChangeOperation,
+        EntityFilter, EntityKey, EntityModification, EntityOperation, EntityOrder, EntityQuery,
+        EntityRange, EthereumCallCache, MetadataOperation, Store, StoreError, StoreEvent,
+        StoreEventStream, StoreEventStreamBox, SubgraphDeploymentStore, TransactionAbortError,
+        SUBSCRIPTION_THROTTLE_INTERVAL,
     };
     pub use crate::components::subgraph::{
-        BlockState, DataSourceLoader, DataSourceTemplateInfo, RuntimeHost, RuntimeHostBuilder,
-        SubgraphAssignmentProvider, SubgraphInstance, SubgraphInstanceManager, SubgraphRegistrar,
-        SubgraphVersionSwitchingMode,
+        BlockState, DataSourceLoader, DataSourceTemplateInfo, HostMetrics, RuntimeHost,
+        RuntimeHostBuilder, SubgraphAssignmentProvider, SubgraphInstance, SubgraphInstanceManager,
+        SubgraphRegistrar, SubgraphVersionSwitchingMode,
     };
     pub use crate::components::{EventConsumer, EventProducer};
 

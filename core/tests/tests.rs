@@ -1,7 +1,6 @@
 extern crate graph;
 extern crate graph_core;
 extern crate graph_mock;
-extern crate graph_runtime_wasm;
 extern crate ipfs_api;
 extern crate semver;
 extern crate walkdir;
@@ -10,18 +9,15 @@ use ipfs_api::IpfsClient;
 use walkdir::WalkDir;
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs::read_to_string;
 use std::io::Cursor;
-use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
-use graph::components::ethereum::*;
 use graph::prelude::*;
-use graph_core::{LinkResolver, SubgraphInstanceManager};
-use graph_mock::{FakeStore, MockBlockStreamBuilder, MockStore};
-use web3::types::*;
+
+use graph_core::LinkResolver;
+use graph_mock::{MockEthereumAdapter, MockStore};
 
 use crate::tokio::timer::Delay;
 
@@ -69,6 +65,7 @@ fn add_subgraph_to_ipfs(
 
 #[ignore]
 #[test]
+#[cfg(any())]
 fn multiple_data_sources_per_subgraph() {
     #[derive(Debug)]
     struct MockRuntimeHost {}
@@ -82,14 +79,14 @@ fn multiple_data_sources_per_subgraph() {
             true
         }
 
-        fn matches_block(&self, _call: EthereumBlockTriggerType) -> bool {
+        fn matches_block(&self, _call: EthereumBlockTriggerType, _block_number: u64) -> bool {
             true
         }
 
         fn process_log(
             &self,
             _: Logger,
-            _: Arc<EthereumBlock>,
+            _: Arc<LightEthereumBlock>,
             _: Arc<Transaction>,
             _: Arc<Log>,
             _: BlockState,
@@ -100,7 +97,7 @@ fn multiple_data_sources_per_subgraph() {
         fn process_call(
             &self,
             _logger: Logger,
-            _block: Arc<EthereumBlock>,
+            _block: Arc<LightEthereumBlock>,
             _transaction: Arc<Transaction>,
             _call: Arc<EthereumCall>,
             _state: BlockState,
@@ -111,7 +108,7 @@ fn multiple_data_sources_per_subgraph() {
         fn process_block(
             &self,
             _logger: Logger,
-            _block: Arc<EthereumBlock>,
+            _block: Arc<LightEthereumBlock>,
             _trigger_type: EthereumBlockTriggerType,
             _state: BlockState,
         ) -> Box<dyn Future<Item = BlockState, Error = Error> + Send> {
@@ -148,6 +145,7 @@ fn multiple_data_sources_per_subgraph() {
             _: SubgraphDeploymentId,
             data_source: DataSource,
             _: Vec<DataSourceTemplate>,
+            _: Arc<HostMetrics>,
         ) -> Result<Self::Host, Error> {
             self.data_sources_received.lock().unwrap().push(data_source);
 
@@ -172,12 +170,14 @@ fn multiple_data_sources_per_subgraph() {
             stores.insert("mainnet".to_string(), Arc::new(FakeStore));
             let host_builder = MockRuntimeHostBuilder::new();
             let block_stream_builder = MockBlockStreamBuilder::new();
+            let metrics_registry = Arc::new(MockMetricsRegistry::new());
 
             let manager = SubgraphInstanceManager::new(
                 &logger_factory,
                 stores,
                 host_builder.clone(),
                 block_stream_builder.clone(),
+                metrics_registry,
             );
 
             // Load a subgraph with two data sources
@@ -251,6 +251,13 @@ fn subgraph_provider_events() {
                 .into_iter()
                 .map(|s| ("mainnet".to_string(), s))
                 .collect();
+            let mock_ethereum_adapter =
+                Arc::new(MockEthereumAdapter::default()) as Arc<dyn EthereumAdapter>;
+            let ethereum_adapters: HashMap<String, Arc<dyn EthereumAdapter>> =
+                vec![mock_ethereum_adapter]
+                    .into_iter()
+                    .map(|e| ("mainnet".to_string(), e))
+                    .collect();
             let graphql_runner = Arc::new(graph_core::GraphQlRunner::new(&logger, store.clone()));
             let mut provider = graph_core::SubgraphAssignmentProvider::new(
                 &logger_factory,
@@ -267,6 +274,7 @@ fn subgraph_provider_events() {
                 Arc::new(provider),
                 store.clone(),
                 stores,
+                ethereum_adapters,
                 node_id.clone(),
                 SubgraphVersionSwitchingMode::Instant,
             );

@@ -168,9 +168,10 @@ where
         object_type: ObjectOrInterface<'_>,
         arguments: &HashMap<&q::Name, q::Value>,
         types_for_interface: &BTreeMap<Name, Vec<ObjectType>>,
+        max_first: u32,
     ) -> Result<q::Value, QueryExecutionError> {
         let object_type = object_type.into();
-        let mut query = build_query(object_type, arguments, types_for_interface)?;
+        let mut query = build_query(object_type, arguments, types_for_interface, max_first)?;
 
         // Add matching filter for derived fields
         let derived_from_field = sast::get_derived_from_field(object_type, field_definition);
@@ -215,25 +216,33 @@ where
             _ => None,
         });
 
-        // subgraph_id directive is injected in all types.
+        // The subgraph_id directive is injected in all types.
         let subgraph_id = parse_subgraph_id(object_type).unwrap();
-        let entity = if let Some(id) = id {
+        let subgraph_id_for_resolve_object = subgraph_id.clone();
+
+        let resolve_object_with_id = |id: &String| -> Result<Option<Entity>, QueryExecutionError> {
             match object_type {
                 ObjectOrInterface::Object(_) => self.store.get(EntityKey {
-                    subgraph_id,
+                    subgraph_id: subgraph_id_for_resolve_object,
                     entity_type: object_type.name().to_owned(),
                     entity_id: id.to_owned(),
-                })?,
+                }),
                 ObjectOrInterface::Interface(interface) => {
                     let entity_types = types_for_interface[&interface.name]
                         .iter()
                         .map(|o| o.name.clone())
                         .collect();
                     let range = EntityRange::first(1);
-                    let query = EntityQuery::new(subgraph_id, entity_types, range);
-                    self.store.find(query)?.into_iter().next()
+                    let mut query =
+                        EntityQuery::new(subgraph_id_for_resolve_object, entity_types, range);
+                    query.filter = Some(EntityFilter::Equal(String::from("id"), Value::from(id)));
+                    Ok(self.store.find(query)?.into_iter().next())
                 }
             }
+        };
+
+        let entity = if let Some(id) = id {
+            resolve_object_with_id(id)?
         } else {
             // Identify whether the field is derived with @derivedFrom
             let derived_from_field = sast::get_derived_from_field(object_type, field_definition);
@@ -250,7 +259,7 @@ where
 
                 let skip_arg_name = q::Name::from("skip");
                 arguments.insert(&skip_arg_name, q::Value::Int(q::Number::from(0)));
-                let mut query = build_query(object_type, &arguments, types_for_interface)?;
+                let mut query = build_query(object_type, &arguments, types_for_interface, 2)?;
                 Self::add_filter_for_derived_field(&mut query, parent, derived_from_field);
 
                 // Find the entity or entities that reference the parent entity
@@ -269,11 +278,7 @@ where
             } else {
                 match parent {
                     Some(q::Value::Object(parent_object)) => match parent_object.get(&field.name) {
-                        Some(q::Value::String(id)) => self.store.get(EntityKey {
-                            subgraph_id,
-                            entity_type: object_type.name().to_owned(),
-                            entity_id: id.to_owned(),
-                        })?,
+                        Some(q::Value::String(id)) => resolve_object_with_id(id)?,
                         _ => None,
                     },
                     _ => panic!("top level queries must either take an `id` or return a list"),
@@ -281,10 +286,7 @@ where
             }
         };
 
-        Ok(match entity {
-            Some(entity) => entity.into(),
-            None => q::Value::Null,
-        })
+        Ok(entity.map_or(q::Value::Null, Into::into))
     }
 
     fn resolve_field_stream<'a, 'b>(

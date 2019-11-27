@@ -1,27 +1,9 @@
-extern crate clap;
-extern crate env_logger;
-extern crate futures;
-extern crate itertools;
-#[macro_use]
-extern crate sentry;
-extern crate graph;
-extern crate graph_core;
-extern crate graph_datasource_ethereum;
-extern crate graph_runtime_wasm;
-extern crate graph_server_http;
-extern crate graph_server_json_rpc;
-extern crate graph_server_websocket;
-extern crate graph_store_postgres;
-extern crate http;
-extern crate ipfs_api;
-extern crate lazy_static;
-extern crate url;
-
 use clap::{App, Arg};
 use futures::sync::mpsc;
 use git_testament::{git_testament, render_testament};
 use ipfs_api::IpfsClient;
 use lazy_static::lazy_static;
+use prometheus::Registry;
 use std::collections::HashMap;
 use std::env;
 use std::str::FromStr;
@@ -29,18 +11,24 @@ use std::time::Duration;
 
 use graph::components::forward;
 use graph::log::logger;
-use graph::prelude::{JsonRpcServer as _, *};
+use graph::prelude::{
+    EthereumAdapter as EthereumAdapterTrait, IndexNodeServer as _, JsonRpcServer as _, *,
+};
 use graph::util::security::SafeDisplay;
+use graph_chain_ethereum::{BlockIngestor, BlockStreamBuilder, Transport};
 use graph_core::{
-    LinkResolver, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
+    LinkResolver, MetricsRegistry, SubgraphAssignmentProvider as IpfsSubgraphAssignmentProvider,
     SubgraphInstanceManager, SubgraphRegistrar as IpfsSubgraphRegistrar,
 };
-use graph_datasource_ethereum::{BlockStreamBuilder, Transport};
 use graph_runtime_wasm::RuntimeHostBuilder as WASMRuntimeHostBuilder;
 use graph_server_http::GraphQLServer as GraphQLQueryServer;
+use graph_server_index_node::IndexNodeServer;
 use graph_server_json_rpc::JsonRpcServer;
+use graph_server_metrics::PrometheusMetricsServer;
 use graph_server_websocket::SubscriptionServer as GraphQLSubscriptionServer;
+use graph_store_postgres::connection_pool::create_connection_pool;
 use graph_store_postgres::{Store as DieselStore, StoreConfig};
+
 use tokio_timer::timer::Timer;
 
 lazy_static! {
@@ -57,13 +45,6 @@ lazy_static! {
         .map(|s| u64::from_str(&s)
              .unwrap_or_else(|_| panic!("failed to parse env var ETHEREUM_ANCESTOR_COUNT")))
         .unwrap_or(50);
-
-    // Start block to use when indexing Ethereum.
-    static ref ETHEREUM_START_BLOCK: u64 = env::var("ETHEREUM_START_BLOCK")
-        .ok()
-        .map(|s| u64::from_str(&s)
-             .unwrap_or_else(|_| panic!("failed to parse env var ETHEREUM_START_BLOCK")))
-        .unwrap_or(0);
 
     static ref TOKIO_THREAD_COUNT: usize = env::var("GRAPH_TOKIO_THREAD_COUNT")
         .ok()
@@ -212,6 +193,13 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
                 .help("Port for the GraphQL HTTP server"),
         )
         .arg(
+            Arg::with_name("index-node-port")
+                .default_value("8030")
+                .long("index-node-port")
+                .value_name("PORT")
+                .help("Port for the index node server"),
+        )
+        .arg(
             Arg::with_name("ws-port")
                 .default_value("8001")
                 .long("ws-port")
@@ -224,6 +212,13 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
                 .long("admin-port")
                 .value_name("PORT")
                 .help("Port for the JSON-RPC admin server"),
+        )
+        .arg(
+            Arg::with_name("metrics-port")
+                .default_value("8040")
+                .long("metrics-port")
+                .value_name("PORT")
+                .help("Port for the Prometheus metrics server"),
         )
         .arg(
             Arg::with_name("node-id")
@@ -337,7 +332,19 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
         .parse()
         .expect("invalid admin port");
 
-    debug!(logger, "Setting up Sentry");
+    // Obtain index node server port
+    let index_node_port = matches
+        .value_of("index-node-port")
+        .unwrap()
+        .parse()
+        .expect("invalid index node server port");
+
+    // Obtain metrics server port
+    let metrics_port = matches
+        .value_of("metrics-port")
+        .unwrap()
+        .parse()
+        .expect("invalid metrics port");
 
     // Obtain DISABLE_BLOCK_INGESTOR setting
     let disable_block_ingestor: bool = matches
@@ -347,7 +354,7 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
         .expect("invalid --disable-block-ingestor/DISABLE_BLOCK_INGESTOR value");
 
     // Obtain STORE_CONNECTION_POOL_SIZE setting
-    let store_conn_pool_size = matches
+    let store_conn_pool_size: u32 = matches
         .value_of("store-connection-pool-size")
         .unwrap()
         .parse()
@@ -358,17 +365,6 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
         panic!("--store-connection-pool-size/STORE_CONNECTION_POOL_SIZE must be > 1")
     }
 
-    // Set up Sentry, with release tracking and panic handling;
-    // fall back to an empty URL, which will result in no errors being reported
-    let sentry_url = env::var_os("THEGRAPH_SENTRY_URL").unwrap_or_else(|| "".into());
-    let _sentry = sentry::init((
-        sentry_url,
-        sentry::ClientOptions {
-            release: sentry_crate_release!(),
-            ..Default::default()
-        },
-    ));
-    sentry::integrations::panic::register_panic_handler();
     info!(logger, "Starting up");
 
     // Parse the IPFS URL from the `--ipfs` command line argument
@@ -445,6 +441,16 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
     // Convert the client into a link resolver
     let link_resolver = Arc::new(LinkResolver::from(ipfs_client));
 
+    // Set up Prometheus registry
+    let prometheus_registry = Arc::new(Registry::new());
+    let metrics_registry = Arc::new(MetricsRegistry::new(
+        logger.clone(),
+        prometheus_registry.clone(),
+    ));
+    let mut metrics_server =
+        PrometheusMetricsServer::new(&logger_factory, prometheus_registry.clone());
+
+    // Ethereum clients
     let eth_adapters = [
         (ConnectionType::RPC, ethereum_rpc),
         (ConnectionType::IPC, ethereum_ipc),
@@ -454,7 +460,12 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
     .cloned()
     .filter(|(_, values)| values.is_some())
     .fold(HashMap::new(), |adapters, (connection_type, values)| {
-        match parse_ethereum_networks_and_nodes(logger.clone(), values.unwrap(), connection_type) {
+        match parse_ethereum_networks_and_nodes(
+            logger.clone(),
+            values.unwrap(),
+            connection_type,
+            metrics_registry.clone(),
+        ) {
             Ok(adapter) => adapters.into_iter().chain(adapter).collect(),
             Err(e) => {
                 panic!(
@@ -465,16 +476,6 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
         }
     });
 
-    // Warn if the start block is != genesis
-    if *ETHEREUM_START_BLOCK > 0 {
-        warn!(
-            logger,
-            "Using {} as the block to start indexing at. \
-             This may cause subgraphs to be only indexed partially",
-            *ETHEREUM_START_BLOCK,
-        );
-    }
-
     // Set up Store
     info!(
         logger,
@@ -483,191 +484,235 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
         "conn_pool_size" => store_conn_pool_size,
     );
 
-    let stores: HashMap<String, Arc<DieselStore>> = eth_adapters
-        .iter()
-        .map(|(network_name, eth_adapter)| {
-            info!(
-                logger, "Connecting to Ethereum...";
-                "network" => &network_name,
-            );
-            match eth_adapter.net_identifiers(&logger).wait() {
-                Ok(network_identifier) => {
-                    info!(
-                    logger,
-                    "Connected to Ethereum";
+    let postgres_conn_pool =
+        create_connection_pool(postgres_url.clone(), store_conn_pool_size, &logger);
+
+    let stores_metrics_registry = metrics_registry.clone();
+    let stores_logger = logger.clone();
+    let stores_error_logger = logger.clone();
+    let stores_eth_adapters = eth_adapters.clone();
+    let contention_logger = logger.clone();
+
+    tokio::spawn(
+        futures::stream::futures_ordered(stores_eth_adapters.into_iter().map(
+            |(network_name, eth_adapter)| {
+                info!(
+                    logger, "Connecting to Ethereum...";
                     "network" => &network_name,
-                    "network_version" => &network_identifier.net_version,
-                    );
-                    (
-                        network_name.to_string(),
-                        Arc::new(DieselStore::new(
-                            StoreConfig {
-                                postgres_url: postgres_url.clone(),
-                                network_name: network_name.to_string(),
-                                start_block: *ETHEREUM_START_BLOCK,
-                                conn_pool_size: store_conn_pool_size,
-                            },
-                            &logger,
-                            network_identifier,
-                        )),
-                    )
-                }
-                Err(e) => {
-                    error!(logger, "Was a valid Ethereum node provided?");
-                    panic!("Failed to connect to Ethereum node: {}", e);
-                }
-            }
+                );
+                eth_adapter
+                    .net_identifiers(&logger)
+                    .map(|network_identifier| (network_name, network_identifier))
+            },
+        ))
+        .map_err(move |e| {
+            error!(stores_error_logger, "Was a valid Ethereum node provided?");
+            panic!("Failed to connect to Ethereum node: {}", e);
         })
-        .collect();
-
-    let generic_store = stores.values().next().expect("error creating stores");
-
-    let graphql_runner = Arc::new(graph_core::GraphQlRunner::new(
-        &logger,
-        generic_store.clone(),
-    ));
-    let mut graphql_server = GraphQLQueryServer::new(
-        &logger_factory,
-        graphql_runner.clone(),
-        generic_store.clone(),
-        node_id.clone(),
-    );
-    let mut subscription_server =
-        GraphQLSubscriptionServer::new(&logger, graphql_runner.clone(), generic_store.clone());
-
-    if !disable_block_ingestor {
-        // BlockIngestor must be configured to keep at least REORG_THRESHOLD ancestors,
-        // otherwise BlockStream will not work properly.
-        // BlockStream expects the blocks after the reorg threshold to be present in the
-        // database.
-        assert!(*ANCESTOR_COUNT >= *REORG_THRESHOLD);
-
-        info!(logger, "Starting block ingestor");
-
-        // Create Ethereum block ingestors and spawn a thread to run each
-        eth_adapters.iter().for_each(|(network_name, eth_adapter)| {
-            let block_ingestor = graph_datasource_ethereum::BlockIngestor::new(
-                stores.get(network_name).expect("network with name").clone(),
-                eth_adapter.clone(),
-                *ANCESTOR_COUNT,
+        .map(move |(network_name, network_identifier)| {
+            info!(
+                stores_logger,
+                "Connected to Ethereum";
+                "network" => &network_name,
+                "network_version" => &network_identifier.net_version,
+            );
+            (
                 network_name.to_string(),
-                &logger_factory,
-                block_polling_interval,
+                Arc::new(DieselStore::new(
+                    StoreConfig {
+                        postgres_url: postgres_url.clone(),
+                        network_name: network_name.to_string(),
+                    },
+                    &stores_logger,
+                    network_identifier,
+                    postgres_conn_pool.clone(),
+                    stores_metrics_registry.clone(),
+                )),
             )
-            .expect("failed to create Ethereum block ingestor");
+        })
+        .collect()
+        .map(|stores| HashMap::from_iter(stores.into_iter()))
+        .and_then(move |stores| {
+            let generic_store = stores.values().next().expect("error creating stores");
 
-            // Run the Ethereum block ingestor in the background
-            tokio::spawn(block_ingestor.into_polling_stream());
-        });
-    }
+            let graphql_runner = Arc::new(graph_core::GraphQlRunner::new(
+                &logger,
+                generic_store.clone(),
+            ));
+            let mut graphql_server = GraphQLQueryServer::new(
+                &logger_factory,
+                graphql_runner.clone(),
+                generic_store.clone(),
+                node_id.clone(),
+            );
+            let mut subscription_server = GraphQLSubscriptionServer::new(
+                &logger,
+                graphql_runner.clone(),
+                generic_store.clone(),
+            );
 
-    let block_stream_builder = BlockStreamBuilder::new(
-        generic_store.clone(),
-        stores.clone(),
-        eth_adapters.clone(),
-        node_id.clone(),
-        *REORG_THRESHOLD,
-    );
-    let runtime_host_builder =
-        WASMRuntimeHostBuilder::new(eth_adapters.clone(), link_resolver.clone(), stores.clone());
+            let mut index_node_server = IndexNodeServer::new(
+                &logger_factory,
+                graphql_runner.clone(),
+                generic_store.clone(),
+                node_id.clone(),
+            );
 
-    let subgraph_instance_manager = SubgraphInstanceManager::new(
-        &logger_factory,
-        stores.clone(),
-        runtime_host_builder,
-        block_stream_builder,
-    );
+            if !disable_block_ingestor {
+                // BlockIngestor must be configured to keep at least REORG_THRESHOLD ancestors,
+                // otherwise BlockStream will not work properly.
+                // BlockStream expects the blocks after the reorg threshold to be present in the
+                // database.
+                assert!(*ANCESTOR_COUNT >= *REORG_THRESHOLD);
 
-    // Create IPFS-based subgraph provider
-    let mut subgraph_provider = IpfsSubgraphAssignmentProvider::new(
-        &logger_factory,
-        link_resolver.clone(),
-        generic_store.clone(),
-        graphql_runner.clone(),
-    );
+                info!(logger, "Starting block ingestor");
 
-    // Forward subgraph events from the subgraph provider to the subgraph instance manager
-    tokio::spawn(forward(&mut subgraph_provider, &subgraph_instance_manager).unwrap());
+                // Create Ethereum block ingestors and spawn a thread to run each
+                eth_adapters.iter().for_each(|(network_name, eth_adapter)| {
+                    let block_ingestor = BlockIngestor::new(
+                        stores.get(network_name).expect("network with name").clone(),
+                        eth_adapter.clone(),
+                        *ANCESTOR_COUNT,
+                        network_name.to_string(),
+                        &logger_factory,
+                        block_polling_interval,
+                    )
+                    .expect("failed to create Ethereum block ingestor");
 
-    // Check version switching mode environment variable
-    let version_switching_mode = SubgraphVersionSwitchingMode::parse(
-        env::var_os("EXPERIMENTAL_SUBGRAPH_VERSION_SWITCHING_MODE")
-            .unwrap_or_else(|| "instant".into())
-            .to_str()
-            .expect("invalid version switching mode"),
-    );
+                    // Run the Ethereum block ingestor in the background
+                    tokio::spawn(block_ingestor.into_polling_stream());
+                });
+            }
 
-    // Create named subgraph provider for resolving subgraph name->ID mappings
-    let subgraph_registrar = Arc::new(IpfsSubgraphRegistrar::new(
-        &logger_factory,
-        link_resolver,
-        Arc::new(subgraph_provider),
-        generic_store.clone(),
-        stores,
-        node_id.clone(),
-        version_switching_mode,
-    ));
-    tokio::spawn(
-        subgraph_registrar
-            .start()
-            .then(|start_result| Ok(start_result.expect("failed to initialize subgraph provider"))),
-    );
+            let block_stream_builder = BlockStreamBuilder::new(
+                generic_store.clone(),
+                stores.clone(),
+                eth_adapters.clone(),
+                node_id.clone(),
+                *REORG_THRESHOLD,
+                metrics_registry.clone(),
+            );
+            let runtime_host_builder = WASMRuntimeHostBuilder::new(
+                eth_adapters.clone(),
+                link_resolver.clone(),
+                stores.clone(),
+            );
 
-    // Start admin JSON-RPC server.
-    let json_rpc_server = JsonRpcServer::serve(
-        json_rpc_port,
-        http_port,
-        ws_port,
-        subgraph_registrar.clone(),
-        node_id.clone(),
-        logger.clone(),
-    )
-    .expect("failed to start JSON-RPC admin server");
+            let subgraph_instance_manager = SubgraphInstanceManager::new(
+                &logger_factory,
+                stores.clone(),
+                eth_adapters.clone(),
+                runtime_host_builder,
+                block_stream_builder,
+                metrics_registry.clone(),
+            );
 
-    // Let the server run forever.
-    std::mem::forget(json_rpc_server);
+            // Create IPFS-based subgraph provider
+            let mut subgraph_provider = IpfsSubgraphAssignmentProvider::new(
+                &logger_factory,
+                link_resolver.clone(),
+                generic_store.clone(),
+                graphql_runner.clone(),
+            );
 
-    // Add the CLI subgraph with a REST request to the admin server.
-    if let Some(subgraph) = subgraph {
-        let (name, hash) = if subgraph.contains(':') {
-            let mut split = subgraph.split(':');
-            (split.next().unwrap(), split.next().unwrap().to_owned())
-        } else {
-            ("cli", subgraph)
-        };
+            // Forward subgraph events from the subgraph provider to the subgraph instance manager
+            tokio::spawn(forward(&mut subgraph_provider, &subgraph_instance_manager).unwrap());
 
-        let name = SubgraphName::new(name)
-            .expect("Subgraph name must contain only a-z, A-Z, 0-9, '-' and '_'");
-        let subgraph_id =
-            SubgraphDeploymentId::new(hash).expect("Subgraph hash must be a valid IPFS hash");
+            // Check version switching mode environment variable
+            let version_switching_mode = SubgraphVersionSwitchingMode::parse(
+                env::var_os("EXPERIMENTAL_SUBGRAPH_VERSION_SWITCHING_MODE")
+                    .unwrap_or_else(|| "instant".into())
+                    .to_str()
+                    .expect("invalid version switching mode"),
+            );
 
-        tokio::spawn(
-            subgraph_registrar
-                .create_subgraph(name.clone())
-                .then(
-                    |result| Ok(result.expect("Failed to create subgraph from `--subgraph` flag")),
-                )
-                .and_then(move |_| {
-                    subgraph_registrar.create_subgraph_version(name, subgraph_id, node_id)
-                })
-                .then(|result| {
-                    Ok(result.expect("Failed to deploy subgraph from `--subgraph` flag"))
-                }),
-        );
-    }
+            // Create named subgraph provider for resolving subgraph name->ID mappings
+            let subgraph_registrar = Arc::new(IpfsSubgraphRegistrar::new(
+                &logger_factory,
+                link_resolver,
+                Arc::new(subgraph_provider),
+                generic_store.clone(),
+                stores,
+                eth_adapters.clone(),
+                node_id.clone(),
+                version_switching_mode,
+            ));
+            tokio::spawn(subgraph_registrar.start().then(|start_result| {
+                Ok(start_result.expect("failed to initialize subgraph provider"))
+            }));
 
-    // Serve GraphQL queries over HTTP
-    tokio::spawn(
-        graphql_server
-            .serve(http_port, ws_port)
-            .expect("Failed to start GraphQL query server"),
-    );
+            // Start admin JSON-RPC server.
+            let json_rpc_server = JsonRpcServer::serve(
+                json_rpc_port,
+                http_port,
+                ws_port,
+                subgraph_registrar.clone(),
+                node_id.clone(),
+                logger.clone(),
+            )
+            .expect("failed to start JSON-RPC admin server");
 
-    // Serve GraphQL subscriptions over WebSockets
-    tokio::spawn(
-        subscription_server
-            .serve(ws_port)
-            .expect("Failed to start GraphQL subscription server"),
+            // Let the server run forever.
+            std::mem::forget(json_rpc_server);
+
+            // Add the CLI subgraph with a REST request to the admin server.
+            if let Some(subgraph) = subgraph {
+                let (name, hash) = if subgraph.contains(':') {
+                    let mut split = subgraph.split(':');
+                    (split.next().unwrap(), split.next().unwrap().to_owned())
+                } else {
+                    ("cli", subgraph)
+                };
+
+                let name = SubgraphName::new(name)
+                    .expect("Subgraph name must contain only a-z, A-Z, 0-9, '-' and '_'");
+                let subgraph_id = SubgraphDeploymentId::new(hash)
+                    .expect("Subgraph hash must be a valid IPFS hash");
+
+                tokio::spawn(
+                    subgraph_registrar
+                        .create_subgraph(name.clone())
+                        .then(|result| {
+                            Ok(result.expect("Failed to create subgraph from `--subgraph` flag"))
+                        })
+                        .and_then(move |_| {
+                            subgraph_registrar.create_subgraph_version(name, subgraph_id, node_id)
+                        })
+                        .then(|result| {
+                            Ok(result.expect("Failed to deploy subgraph from `--subgraph` flag"))
+                        }),
+                );
+            }
+
+            // Serve GraphQL queries over HTTP
+            tokio::spawn(
+                graphql_server
+                    .serve(http_port, ws_port)
+                    .expect("Failed to start GraphQL query server"),
+            );
+
+            // Serve GraphQL subscriptions over WebSockets
+            tokio::spawn(
+                subscription_server
+                    .serve(ws_port)
+                    .expect("Failed to start GraphQL subscription server"),
+            );
+
+            // Run the index node server
+            tokio::spawn(
+                index_node_server
+                    .serve(index_node_port)
+                    .expect("Failed to start index node server"),
+            );
+
+            tokio::spawn(
+                metrics_server
+                    .serve(metrics_port)
+                    .expect("Failed to start metrics server"),
+            );
+
+            future::ok(())
+        }),
     );
 
     // Periodically check for contention in the tokio threadpool. First spawn a
@@ -678,7 +723,6 @@ fn async_main() -> impl Future<Item = (), Error = ()> + Send + 'static {
         ping_receive
             .for_each(move |pong_send| pong_send.clone().send(()).map(|_| ()).map_err(|_| ())),
     );
-    let contention_logger = logger.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
         let (pong_send, pong_receive) = crossbeam_channel::bounded(1);
@@ -707,13 +751,9 @@ fn parse_ethereum_networks_and_nodes(
     logger: Logger,
     networks: clap::Values,
     connection_type: ConnectionType,
-) -> Result<
-    HashMap<
-        String,
-        Arc<graph_datasource_ethereum::EthereumAdapter<graph_datasource_ethereum::Transport>>,
-    >,
-    Error,
-> {
+    registry: Arc<MetricsRegistry>,
+) -> Result<HashMap<String, Arc<dyn EthereumAdapterTrait>>, Error> {
+    let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
     networks
         .map(|network| {
             if network.starts_with("wss://")
@@ -765,10 +805,10 @@ fn parse_ethereum_networks_and_nodes(
 
                 Ok((
                     name.to_string(),
-                    Arc::new(graph_datasource_ethereum::EthereumAdapter::new(
+                    Arc::new(graph_chain_ethereum::EthereumAdapter::new(
                         transport,
-                        *ETHEREUM_START_BLOCK,
-                    )),
+                        eth_rpc_metrics.clone(),
+                    )) as Arc<dyn EthereumAdapter>,
                 ))
             }
         })

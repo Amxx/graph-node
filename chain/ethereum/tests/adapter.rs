@@ -9,13 +9,11 @@ use ethabi::{Function, Param, ParamType, Token};
 use graph::components::ethereum::EthereumContractCall;
 use graph::prelude::EthereumAdapter as EthereumAdapterTrait;
 use graph::prelude::*;
-use graph_datasource_ethereum::EthereumAdapter;
-use web3::error::Error;
+use graph_chain_ethereum::EthereumAdapter;
+use mock::MockMetricsRegistry;
 use web3::helpers::*;
 use web3::types::*;
 use web3::{BatchTransport, RequestId, Transport};
-
-pub type Result<T> = Box<dyn Future<Item = T, Error = Error> + Send + 'static>;
 
 fn mock_block() -> Block<U256> {
     Block {
@@ -51,7 +49,7 @@ pub struct TestTransport {
 }
 
 impl Transport for TestTransport {
-    type Out = Result<jsonrpc_core::Value>;
+    type Out = Box<dyn Future<Item = jsonrpc_core::Value, Error = web3::Error> + Send + 'static>;
 
     fn prepare(
         &self,
@@ -63,16 +61,20 @@ impl Transport for TestTransport {
         (self.requests.lock().unwrap().len(), request)
     }
 
-    fn send(&self, _: RequestId, _: jsonrpc_core::Call) -> Result<jsonrpc_core::Value> {
+    fn send(&self, _: RequestId, _: jsonrpc_core::Call) -> Self::Out {
         match self.response.lock().unwrap().pop_front() {
             Some(response) => Box::new(finished(response)),
-            None => Box::new(failed(Error::Unreachable.into())),
+            None => Box::new(failed(web3::Error::Unreachable.into())),
         }
     }
 }
 
 impl BatchTransport for TestTransport {
-    type Batch = Result<Vec<::std::result::Result<jsonrpc_core::Value, Error>>>;
+    type Batch = Box<
+        dyn Future<Item = Vec<Result<jsonrpc_core::Value, web3::Error>>, Error = web3::Error>
+            + Send
+            + 'static,
+    >;
 
     fn send_batch<T>(&self, requests: T) -> Self::Batch
     where
@@ -128,9 +130,33 @@ impl TestTransport {
     }
 }
 
+struct FakeEthereumCallCache;
+
+impl EthereumCallCache for FakeEthereumCallCache {
+    fn get_call(
+        &self,
+        _: ethabi::Address,
+        _: &[u8],
+        _: EthereumBlockPointer,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        unimplemented!()
+    }
+
+    fn set_call(
+        &self,
+        _: ethabi::Address,
+        _: &[u8],
+        _: EthereumBlockPointer,
+        _: &[u8],
+    ) -> Result<(), Error> {
+        unimplemented!()
+    }
+}
+
 #[test]
 #[ignore]
 fn contract_call() {
+    let registry = Arc::new(MockMetricsRegistry::new());
     let mut transport = TestTransport::default();
 
     transport.add_response(serde_json::to_value(mock_block()).unwrap());
@@ -142,7 +168,10 @@ fn contract_call() {
     )));
 
     let logger = Logger::root(slog::Discard, o!());
-    let adapter = EthereumAdapter::new(transport, 0u64);
+
+    let provider_metrics = Arc::new(ProviderEthRpcMetrics::new(registry.clone()));
+
+    let adapter = EthereumAdapter::new(transport, provider_metrics);
     let balance_of = Function {
         name: "balanceOf".to_owned(),
         inputs: vec![Param {
@@ -164,7 +193,10 @@ fn contract_call() {
         function: function,
         args: vec![Token::Address(holder_addr)],
     };
-    let call_result = adapter.contract_call(&logger, call).wait().unwrap();
+    let call_result = adapter
+        .contract_call(&logger, call, Arc::new(FakeEthereumCallCache))
+        .wait()
+        .unwrap();
 
     assert_eq!(call_result[0], Token::Uint(U256::from(100000)));
 }

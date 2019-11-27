@@ -1,74 +1,117 @@
 use ethabi::LogParam;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Ordering;
 use web3::types::*;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct EthereumBlockWithTriggers {
-    pub ethereum_block: EthereumBlock,
-    pub triggers: Vec<EthereumTrigger>,
-    pub calls: Option<Vec<EthereumCall>>,
+pub type LightEthereumBlock = Block<Transaction>;
+
+pub trait LightEthereumBlockExt {
+    fn number(&self) -> u64;
+    fn transaction_for_log(&self, log: &Log) -> Option<Transaction>;
+    fn transaction_for_call(&self, call: &EthereumCall) -> Option<Transaction>;
+    fn parent_ptr(&self) -> Option<EthereumBlockPointer>;
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+impl LightEthereumBlockExt for LightEthereumBlock {
+    fn number(&self) -> u64 {
+        self.number.unwrap().as_u64()
+    }
+
+    fn transaction_for_log(&self, log: &Log) -> Option<Transaction> {
+        log.transaction_hash
+            .and_then(|hash| self.transactions.iter().find(|tx| tx.hash == hash))
+            .cloned()
+    }
+
+    fn transaction_for_call(&self, call: &EthereumCall) -> Option<Transaction> {
+        call.transaction_hash
+            .and_then(|hash| self.transactions.iter().find(|tx| tx.hash == hash))
+            .cloned()
+    }
+
+    fn parent_ptr(&self) -> Option<EthereumBlockPointer> {
+        match self.number() {
+            0 => None,
+            n => Some(EthereumBlockPointer {
+                hash: self.parent_hash,
+                number: n - 1,
+            }),
+        }
+    }
+}
+
+/// This is used in `EthereumAdapter::triggers_in_block`, called when re-processing a block for
+/// newly created data sources. This allows the re-processing to be reorg safe without having to
+/// always fetch the full block data.
+#[derive(Clone, Debug)]
+pub enum BlockFinality {
+    /// If a block is final, we only need the header and the triggers.
+    Final(LightEthereumBlock),
+
+    // If a block may still be reorged, we need to work with more local data.
+    NonFinal(EthereumBlockWithCalls),
+}
+
+impl BlockFinality {
+    pub fn light_block(&self) -> LightEthereumBlock {
+        match self {
+            BlockFinality::Final(block) => block.clone(),
+            BlockFinality::NonFinal(block) => block.ethereum_block.block.clone(),
+        }
+    }
+
+    pub fn number(&self) -> u64 {
+        match self {
+            BlockFinality::Final(block) => block.number(),
+            BlockFinality::NonFinal(block) => block.ethereum_block.block.number(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EthereumBlockWithTriggers {
+    pub ethereum_block: BlockFinality,
+    pub triggers: Vec<EthereumTrigger>,
+}
+
+impl EthereumBlockWithTriggers {
+    pub fn new(mut triggers: Vec<EthereumTrigger>, ethereum_block: BlockFinality) -> Self {
+        // Sort the triggers
+        triggers.sort_by(|a, b| {
+            let a_tx_index = a.transaction_index();
+            let b_tx_index = b.transaction_index();
+            if a_tx_index.is_none() && b_tx_index.is_none() {
+                return Ordering::Equal;
+            }
+            if a_tx_index.is_none() {
+                return Ordering::Greater;
+            }
+            if b_tx_index.is_none() {
+                return Ordering::Less;
+            }
+            a_tx_index.unwrap().cmp(&b_tx_index.unwrap())
+        });
+
+        EthereumBlockWithTriggers {
+            ethereum_block,
+            triggers,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct EthereumBlockWithCalls {
     pub ethereum_block: EthereumBlock,
     pub calls: Option<Vec<EthereumCall>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct EthereumBlock {
-    pub block: Block<Transaction>,
+    pub block: LightEthereumBlock,
     pub transaction_receipts: Vec<TransactionReceipt>,
 }
 
-impl EthereumBlock {
-    pub fn transaction_for_log(&self, log: &Log) -> Option<Transaction> {
-        log.transaction_hash
-            .and_then(|hash| self.block.transactions.iter().find(|tx| tx.hash == hash))
-            .cloned()
-    }
-
-    pub fn transaction_for_call(&self, call: &EthereumCall) -> Option<Transaction> {
-        call.transaction_hash
-            .and_then(|hash| self.block.transactions.iter().find(|tx| tx.hash == hash))
-            .cloned()
-    }
-}
-
-// Remove this and derive after a new web3 is released.
-impl Default for EthereumBlock {
-    fn default() -> Self {
-        Self {
-            block: Block {
-                hash: Some(H256::default()),
-                parent_hash: H256::default(),
-                uncles_hash: H256::default(),
-                author: H160::default(),
-                state_root: H256::default(),
-                transactions_root: H256::default(),
-                receipts_root: H256::default(),
-                number: None,
-                gas_used: U256::default(),
-                gas_limit: U256::default(),
-                extra_data: Bytes(vec![]),
-                logs_bloom: H2048::default(),
-                timestamp: U256::default(),
-                difficulty: U256::default(),
-                total_difficulty: U256::default(),
-                seal_fields: vec![],
-                uncles: vec![],
-                transactions: vec![],
-                size: None,
-                mix_hash: Some(H256::default()),
-                nonce: None,
-            },
-            transaction_receipts: vec![],
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EthereumCall {
     pub from: Address,
     pub to: Address,
@@ -79,6 +122,7 @@ pub struct EthereumCall {
     pub block_number: u64,
     pub block_hash: H256,
     pub transaction_hash: Option<H256>,
+    transaction_index: u64,
 }
 
 impl EthereumCall {
@@ -100,6 +144,10 @@ impl EthereumCall {
             _ => return None,
         };
 
+        // The only traces without transactions are those from Parity block reward contracts, we
+        // don't support triggering on that.
+        let transaction_index = trace.transaction_position? as u64;
+
         Some(EthereumCall {
             from: call.from,
             to: call.to,
@@ -110,48 +158,53 @@ impl EthereumCall {
             block_number: trace.block_number,
             block_hash: trace.block_hash,
             transaction_hash: trace.transaction_hash,
+            transaction_index,
         })
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 pub enum EthereumTrigger {
-    Block(EthereumBlockTriggerType),
+    Block(EthereumBlockPointer, EthereumBlockTriggerType),
     Call(EthereumCall),
     Log(Log),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 pub enum EthereumBlockTriggerType {
     Every,
     WithCallTo(Address),
 }
 
 impl EthereumTrigger {
-    pub fn transaction_index(
-        &self,
-        transaction_hash_index_lookup: &HashMap<H256, u64>,
-    ) -> Result<Option<u64>, ()> {
+    fn transaction_index(&self) -> Option<u64> {
         match self {
-            EthereumTrigger::Log(log) => {
-                match transaction_hash_index_lookup.get(&log.transaction_hash.unwrap()) {
-                    Some(index) => Ok(Some(*index)),
-                    None => Err(()),
-                }
-            }
-            EthereumTrigger::Call(call) => {
-                match transaction_hash_index_lookup.get(&call.transaction_hash.unwrap()) {
-                    Some(index) => Ok(Some(*index)),
-                    None => Err(()),
-                }
-            }
-            EthereumTrigger::Block(_call) => Ok(None),
+            // We only handle logs that are in a block and therefore have a `transaction_index`.
+            EthereumTrigger::Log(log) => Some(log.transaction_index.unwrap().as_u64()),
+            EthereumTrigger::Call(call) => Some(call.transaction_index),
+            EthereumTrigger::Block(_, _) => None,
+        }
+    }
+
+    pub fn block_number(&self) -> u64 {
+        match self {
+            EthereumTrigger::Block(block_ptr, _) => block_ptr.number,
+            EthereumTrigger::Call(call) => call.block_number,
+            EthereumTrigger::Log(log) => log.block_number.unwrap().as_u64(),
+        }
+    }
+
+    pub fn block_hash(&self) -> H256 {
+        match self {
+            EthereumTrigger::Block(block_ptr, _) => block_ptr.hash,
+            EthereumTrigger::Call(call) => call.block_hash,
+            EthereumTrigger::Log(log) => log.block_hash.unwrap(),
         }
     }
 }
 
 /// Ethereum block data.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct EthereumBlockData {
     pub hash: H256,
     pub parent_hash: H256,
@@ -292,21 +345,13 @@ impl Clone for EthereumCallData {
 /// A block hash and block number from a specific Ethereum block.
 ///
 /// Maximum block number supported: 2^63 - 1
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EthereumBlockPointer {
     pub hash: H256,
     pub number: u64,
 }
 
 impl EthereumBlockPointer {
-    /// Creates a pointer to the parent of the specified block.
-    pub fn to_parent(b: &EthereumBlock) -> EthereumBlockPointer {
-        EthereumBlockPointer {
-            hash: b.block.parent_hash,
-            number: b.block.number.unwrap().as_u64() - 1,
-        }
-    }
-
     /// Encodes the block hash into a hexadecimal string **without** a "0x" prefix.
     /// Hashes are stored in the database in this format.
     ///
@@ -373,5 +418,35 @@ impl From<(H256, i64)> for EthereumBlockPointer {
             hash,
             number: number as u64,
         }
+    }
+}
+
+impl<'a> From<&'a EthereumCall> for EthereumBlockPointer {
+    fn from(call: &'a EthereumCall) -> EthereumBlockPointer {
+        EthereumBlockPointer {
+            hash: call.block_hash,
+            number: call.block_number,
+        }
+    }
+}
+
+impl<'a> From<&'a BlockFinality> for EthereumBlockPointer {
+    fn from(block: &'a BlockFinality) -> EthereumBlockPointer {
+        match block {
+            BlockFinality::Final(b) => b.into(),
+            BlockFinality::NonFinal(b) => EthereumBlockPointer::from(&b.ethereum_block),
+        }
+    }
+}
+
+impl From<EthereumBlockPointer> for H256 {
+    fn from(ptr: EthereumBlockPointer) -> Self {
+        ptr.hash
+    }
+}
+
+impl From<EthereumBlockPointer> for u64 {
+    fn from(ptr: EthereumBlockPointer) -> Self {
+        ptr.number
     }
 }

@@ -27,11 +27,12 @@ fn insert_and_query(
 
     let logger = Logger::root(slog::Discard, o!());
 
-    let ops = SubgraphDeploymentEntity::new(&manifest, false, false, Default::default(), 1)
-        .create_operations_replace(&subgraph_id);
-    STORE
-        .create_subgraph_deployment(&logger, &subgraph_id, ops)
-        .unwrap();
+    let ops = SubgraphDeploymentEntity::new(&manifest, false, false, None, None)
+        .create_operations_replace(&subgraph_id)
+        .into_iter()
+        .map(|op| op.into())
+        .collect();
+    STORE.create_subgraph_deployment(&schema, ops).unwrap();
 
     let insert_ops = entities
         .into_iter()
@@ -44,7 +45,12 @@ fn insert_and_query(
             data,
         });
 
-    STORE.apply_entity_operations(insert_ops.collect(), None)?;
+    transact_entity_operations(
+        &STORE,
+        subgraph_id.clone(),
+        GENESIS_PTR.clone(),
+        insert_ops.collect::<Vec<_>>(),
+    )?;
 
     let resolver = StoreResolver::new(&logger, STORE.clone());
 
@@ -54,10 +60,11 @@ fn insert_and_query(
         deadline: None,
         max_complexity: None,
         max_depth: 100,
+        max_first: std::u32::MAX,
     };
     let document = graphql_parser::parse_query(query).unwrap();
     let query = Query {
-        schema: STORE.subgraph_schema(&subgraph_id).unwrap(),
+        schema: STORE.api_schema(&subgraph_id).unwrap(),
         document,
         variables: None,
     };
@@ -156,7 +163,16 @@ fn one_interface_multiple_entities() {
     assert_eq!(
         format!("{:?}", res.data.unwrap()),
         "Object({\"leggeds\": List([Object({\"legs\": Int(Number(3))}), Object({\"legs\": Int(Number(4))})])})"
-    )
+    );
+
+    // Test for support issue #32.
+    let query = "query { legged(id: \"2\") { legs } }";
+    let res = insert_and_query(subgraph_id, schema, vec![], query).unwrap();
+    assert!(res.errors.is_none());
+    assert_eq!(
+        format!("{:?}", res.data.unwrap()),
+        "Object({\"legged\": Object({\"legs\": Int(Number(4))})})",
+    );
 }
 
 #[test]
@@ -184,6 +200,67 @@ fn reference_interface() {
 }
 
 #[test]
+fn follow_interface_reference_invalid() {
+    let subgraph_id = "FollowInterfaceReferenceInvalid";
+    let schema = "interface Legged { legs: Int! }
+                  type Animal implements Legged @entity {
+                    id: ID!
+                    legs: Int!
+                    parent: Legged
+                  }";
+
+    let query = "query { legged(id: \"child\") { parent { id } } }";
+
+    let res = insert_and_query(subgraph_id, schema, vec![], query).unwrap();
+
+    match &res.errors.unwrap()[0] {
+        QueryError::ExecutionError(QueryExecutionError::UnknownField(_, type_name, field_name)) => {
+            assert_eq!(type_name, "Legged");
+            assert_eq!(field_name, "parent");
+        }
+        e => panic!("error {} is not the expected one", e),
+    }
+}
+
+#[test]
+fn follow_interface_reference() {
+    let subgraph_id = "FollowInterfaceReference";
+    let schema = "interface Legged { id: ID!, legs: Int! }
+                  type Animal implements Legged @entity {
+                    id: ID!
+                    legs: Int!
+                    parent: Legged
+                  }";
+
+    let query = "query { legged(id: \"child\") { ... on Animal { parent { id } } } }";
+
+    let parent = (
+        Entity::from(vec![
+            ("id", Value::from("parent")),
+            ("legs", Value::from(4)),
+            ("parent", Value::Null),
+        ]),
+        "Animal",
+    );
+    let child = (
+        Entity::from(vec![
+            ("id", Value::from("child")),
+            ("legs", Value::from(3)),
+            ("parent", Value::String("parent".into())),
+        ]),
+        "Animal",
+    );
+
+    let res = insert_and_query(subgraph_id, schema, vec![parent, child], query).unwrap();
+
+    assert!(res.errors.is_none(), format!("{:#?}", res.errors));
+    assert_eq!(
+        format!("{:?}", res.data.unwrap()),
+        "Object({\"legged\": Object({\"parent\": Object({\"id\": String(\"parent\")})})})"
+    )
+}
+
+#[test]
 fn conflicting_implementors_id() {
     let subgraph_id = "ConflictingImplementorsId";
     let schema = "interface Legged { legs: Int }
@@ -203,11 +280,18 @@ fn conflicting_implementors_id() {
     let query = "query { leggeds(first: 100) { legs } }";
 
     let res = insert_and_query(subgraph_id, schema, vec![animal, furniture], query);
-    assert_eq!(
-        res.unwrap_err().to_string(),
+
+    let msg = res.unwrap_err().to_string();
+    // We don't know in which order the two entities get inserted; the two
+    // error messages only differ in who gets inserted first
+    const EXPECTED1: &str =
         "tried to set entity of type `Furniture` with ID \"1\" but an entity of type `Animal`, \
-         which has an interface in common with `Furniture`, exists with the same ID"
-    );
+         which has an interface in common with `Furniture`, exists with the same ID";
+    const EXPECTED2: &str =
+        "tried to set entity of type `Animal` with ID \"1\" but an entity of type `Furniture`, \
+         which has an interface in common with `Animal`, exists with the same ID";
+
+    assert!(msg == EXPECTED1 || msg == EXPECTED2);
 }
 
 #[test]
@@ -339,4 +423,28 @@ fn interface_inline_fragment() {
         format!("{:?}", res.data.unwrap()),
         r#"Object({"leggeds": List([Object({"airspeed": Int(Number(24))}), Object({"name": String("cow")})])})"#
     );
+}
+
+#[test]
+fn invalid_fragment() {
+    let subgraph_id = "InvalidFragment";
+    let schema = "interface Legged { legs: Int! }
+                  type Animal implements Legged @entity {
+                    id: ID!
+                    name: String!
+                    legs: Int!
+                    parent: Legged
+                  }";
+
+    let query = "query { legged(id: \"child\") { ...{ name } } }";
+
+    let res = insert_and_query(subgraph_id, schema, vec![], query).unwrap();
+
+    match &res.errors.unwrap()[0] {
+        QueryError::ExecutionError(QueryExecutionError::UnknownField(_, type_name, field_name)) => {
+            assert_eq!(type_name, "Legged");
+            assert_eq!(field_name, "name");
+        }
+        e => panic!("error {} is not the expected one", e),
+    }
 }

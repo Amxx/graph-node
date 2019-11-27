@@ -1,17 +1,17 @@
 use std::convert::TryFrom;
 use std::fmt;
 use std::ops::Deref;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use semver::Version;
 use wasmi::{
     nan_preserving_float::F64, Error, Externals, FuncInstance, FuncRef, HostError, ImportsBuilder,
-    MemoryRef, Module, ModuleImportResolver, ModuleInstance, ModuleRef, RuntimeArgs, RuntimeValue,
+    MemoryRef, ModuleImportResolver, ModuleInstance, ModuleRef, RuntimeArgs, RuntimeValue,
     Signature, Trap,
 };
 
-use crate::host_exports::{self, HostExportError, HostExports};
-use crate::MappingContext;
+use crate::host_exports::{self, HostExportError};
+use crate::mapping::MappingContext;
 use ethabi::LogParam;
 use graph::components::ethereum::*;
 use graph::data::store;
@@ -21,6 +21,7 @@ use web3::types::{Log, Transaction, U256};
 use crate::asc_abi::asc_ptr::*;
 use crate::asc_abi::class::*;
 use crate::asc_abi::*;
+use crate::mapping::ValidModule;
 
 #[cfg(test)]
 mod test;
@@ -65,6 +66,19 @@ const DATA_SOURCE_CREATE_INDEX: usize = 35;
 const ENS_NAME_BY_HASH: usize = 36;
 const LOG_LOG: usize = 37;
 const BIG_INT_POW: usize = 38;
+const DATA_SOURCE_ADDRESS: usize = 39;
+const DATA_SOURCE_NETWORK: usize = 40;
+
+/// Transform function index into the function name string
+fn fn_index_to_metrics_string(index: usize) -> Option<String> {
+    match index {
+        STORE_GET_FUNC_INDEX => Some(String::from("store_get")),
+        ETHEREUM_CALL_FUNC_INDEX => Some(String::from("ethereum_call")),
+        IPFS_MAP_FUNC_INDEX => Some(String::from("ipfs_map")),
+        IPFS_CAT_FUNC_INDEX => Some(String::from("ipfs_cat")),
+        _ => None,
+    }
+}
 
 /// A common error is a trap in the host, so simplify the message in that case.
 fn format_wasmi_error(e: Error) -> String {
@@ -77,112 +91,15 @@ fn format_wasmi_error(e: Error) -> String {
     }
 }
 
-pub struct WasmiModuleConfig<T, L, S> {
-    pub subgraph_id: SubgraphDeploymentId,
-    pub parsed_module: Arc<parity_wasm::elements::Module>,
-    pub api_version: Version,
-    pub data_source_name: String,
-    pub templates: Vec<DataSourceTemplate>,
-    pub abis: Vec<MappingABI>,
-    pub ethereum_adapter: Arc<T>,
-    pub link_resolver: Arc<L>,
-    pub store: Arc<S>,
-    pub handler_timeout: Option<Duration>,
-}
-
-/// A pre-processed and valid WASM module, ready to be started as a WasmiModule.
-pub(crate) struct ValidModule<T, L, S, U> {
-    pub logger: Logger,
-    pub module: Module,
-    host_exports: HostExports<T, L, S, U>,
-    user_module: Option<String>,
-}
-
-impl<T, L, S, U> ValidModule<T, L, S, U>
-where
-    T: EthereumAdapter,
-    L: LinkResolver,
-    S: Store + Send + Sync + 'static,
-    U: Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
-    /// Pre-process and validate the module.
-    pub fn new(
-        logger: &Logger,
-        config: WasmiModuleConfig<T, L, S>,
-        task_sink: U,
-    ) -> Result<Self, FailureError> {
-        let logger = logger.new(o!("component" => "WasmiModule"));
-
-        // Clone the parsed module so we can create an instance of `Module` from it
-        let parsed_module = config.parsed_module.as_ref().clone();
-
-        // Inject metering calls, which are used for checking timeouts.
-        let parsed_module = pwasm_utils::inject_gas_counter(parsed_module, &Default::default())
-            .map_err(|_| err_msg("failed to inject gas counter"))?;
-
-        // `inject_gas_counter` injects an import so the section must exist.
-        let import_section = parsed_module.import_section().unwrap().clone();
-
-        // Hack: AS currently puts all user imports in one module, in addition
-        // to the built-in "env" module. The name of that module is not fixed,
-        // to able able to infer the name we allow only one module with imports,
-        // with "env" being optional.
-        let mut user_modules: Vec<_> = import_section
-            .entries()
-            .into_iter()
-            .map(|import| import.module().to_owned())
-            .filter(|module| module != "env")
-            .collect();
-        user_modules.dedup();
-        let user_module = match user_modules.len() {
-            0 => None,
-            1 => Some(user_modules.into_iter().next().unwrap()),
-            _ => return Err(err_msg("WASM module has multiple import sections")),
-        };
-
-        let module = Module::from_parity_wasm_module(parsed_module).map_err(|e| {
-            format_err!(
-                "Invalid module `{}`: {}",
-                user_module.as_ref().unwrap_or(&String::new()),
-                e
-            )
-        })?;
-
-        // Create new instance of externally hosted functions invoker
-        let host_exports = HostExports::new(
-            config.subgraph_id,
-            config.api_version,
-            config.data_source_name,
-            config.templates,
-            config.abis,
-            config.ethereum_adapter.clone(),
-            config.link_resolver.clone(),
-            config.store.clone(),
-            task_sink,
-            config.handler_timeout,
-        );
-
-        Ok(ValidModule {
-            logger,
-            module,
-            host_exports,
-            user_module,
-        })
-    }
-}
-
 /// A WASM module based on wasmi that powers a subgraph runtime.
-pub(crate) struct WasmiModule<T, L, S, U> {
-    pub logger: Logger,
+pub(crate) struct WasmiModule<U> {
     pub module: ModuleRef,
     memory: MemoryRef,
 
     pub ctx: MappingContext,
-    pub valid_module: Arc<ValidModule<T, L, S, U>>,
+    pub(crate) valid_module: Arc<ValidModule>,
+    pub(crate) task_sink: U,
+    pub(crate) host_metrics: Arc<HostMetrics>,
 
     // Time when the current handler began processing.
     start_time: Instant,
@@ -196,13 +113,13 @@ pub(crate) struct WasmiModule<T, L, S, U> {
 
     // Number of free bytes starting from `arena_start_ptr`.
     arena_free_size: u32,
+
+    // How many times we've passed a timeout checkpoint during execution.
+    timeout_checkpoint_count: u64,
 }
 
-impl<T, L, S, U> WasmiModule<T, L, S, U>
+impl<U> WasmiModule<U>
 where
-    T: EthereumAdapter,
-    L: LinkResolver,
-    S: Store + Send + Sync + 'static,
     U: Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>
         + Clone
         + Send
@@ -211,11 +128,11 @@ where
 {
     /// Creates a new wasmi module
     pub fn from_valid_module_with_ctx(
-        valid_module: Arc<ValidModule<T, L, S, U>>,
+        valid_module: Arc<ValidModule>,
         ctx: MappingContext,
+        task_sink: U,
+        host_metrics: Arc<HostMetrics>,
     ) -> Result<Self, FailureError> {
-        let logger = valid_module.logger.new(o!("component" => "WasmiModule"));
-
         // Build import resolver
         let mut imports = ImportsBuilder::new();
         imports.push_resolver("env", &EnvModuleResolver);
@@ -237,17 +154,19 @@ where
             .clone();
 
         let mut this = WasmiModule {
-            logger,
             module: not_started_module,
             memory,
             ctx,
             valid_module: valid_module.clone(),
+            task_sink,
+            host_metrics,
             start_time: Instant::now(),
             running_start: true,
 
             // `arena_start_ptr` will be set on the first call to `raw_new`.
             arena_free_size: 0,
             arena_start_ptr: 0,
+            timeout_checkpoint_count: 0,
         };
 
         this.module = module
@@ -256,10 +175,6 @@ where
         this.running_start = false;
 
         Ok(this)
-    }
-
-    pub(crate) fn host_exports(&self) -> &HostExports<T, L, S, U> {
-        &self.valid_module.host_exports
     }
 
     pub(crate) fn handle_ethereum_log(
@@ -271,16 +186,16 @@ where
     ) -> Result<BlockState, FailureError> {
         self.start_time = Instant::now();
 
-        let block = self.ctx.block.block.clone();
+        let block = self.ctx.block.clone();
 
         // Prepare an EthereumEvent for the WASM runtime
         // Decide on the destination type using the mapping
         // api version provided in the subgraph manifest
-        let event = if self.host_exports().api_version >= Version::new(0, 0, 2) {
+        let event = if self.ctx.host_exports.api_version >= Version::new(0, 0, 2) {
             RuntimeValue::from(
                 self.asc_new::<AscEthereumEvent<AscEthereumTransaction_0_0_2>, _>(
                     &EthereumEventData {
-                        block: EthereumBlockData::from(&block),
+                        block: EthereumBlockData::from(block.as_ref()),
                         transaction: EthereumTransactionData::from(transaction.deref()),
                         address: log.address,
                         log_index: log.log_index.unwrap_or(U256::zero()),
@@ -293,7 +208,7 @@ where
         } else {
             RuntimeValue::from(self.asc_new::<AscEthereumEvent<AscEthereumTransaction>, _>(
                 &EthereumEventData {
-                    block: EthereumBlockData::from(&block),
+                    block: EthereumBlockData::from(block.as_ref()),
                     transaction: EthereumTransactionData::from(transaction.deref()),
                     address: log.address,
                     log_index: log.log_index.unwrap_or(U256::zero()),
@@ -358,12 +273,12 @@ where
         let call = EthereumCallData {
             to: call.to,
             from: call.from,
-            block: EthereumBlockData::from(&self.ctx.block.block),
+            block: EthereumBlockData::from(self.ctx.block.as_ref()),
             transaction: EthereumTransactionData::from(transaction.deref()),
             inputs,
             outputs,
         };
-        let arg = if self.host_exports().api_version >= Version::new(0, 0, 3) {
+        let arg = if self.ctx.host_exports.api_version >= Version::new(0, 0, 3) {
             RuntimeValue::from(self.asc_new::<AscEthereumCall_0_0_3, _>(&call))
         } else {
             RuntimeValue::from(self.asc_new::<AscEthereumCall, _>(&call))
@@ -390,7 +305,7 @@ where
         self.start_time = Instant::now();
 
         // Prepare an EthereumBlock for the WASM runtime
-        let arg = EthereumBlockData::from(&self.ctx.block.block);
+        let arg = EthereumBlockData::from(self.ctx.block.as_ref());
 
         let result = self.module.clone().invoke_export(
             handler_name,
@@ -408,11 +323,8 @@ where
     }
 }
 
-impl<T, L, S, U> AscHeap for WasmiModule<T, L, S, U>
+impl<U> AscHeap for WasmiModule<U>
 where
-    T: EthereumAdapter,
-    L: LinkResolver,
-    S: Store + Send + Sync + 'static,
     U: Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>
         + Clone
         + Send
@@ -458,19 +370,21 @@ where
 impl<E> HostError for HostExportError<E> where E: fmt::Debug + fmt::Display + Send + Sync + 'static {}
 
 // Implementation of externals.
-impl<T, L, S, U> WasmiModule<T, L, S, U>
+impl<U> WasmiModule<U>
 where
-    T: EthereumAdapter,
-    L: LinkResolver,
-    S: Store + Send + Sync + 'static,
     U: Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>
         + Clone
         + Send
         + Sync
         + 'static,
 {
-    fn gas(&mut self, _gas_spent: u32) -> Result<Option<RuntimeValue>, Trap> {
-        self.host_exports().check_timeout(self.start_time)?;
+    fn gas(&mut self) -> Result<Option<RuntimeValue>, Trap> {
+        // This function is called so often that the overhead of calling `Instant::now()` every
+        // time would be significant, so we spread out the checks.
+        if self.timeout_checkpoint_count % 100 == 0 {
+            self.ctx.host_exports.check_timeout(self.start_time)?;
+        }
+        self.timeout_checkpoint_count += 1;
         Ok(None)
     }
 
@@ -500,7 +414,8 @@ where
             _ => Some(column_number),
         };
         Err(self
-            .host_exports()
+            .ctx
+            .host_exports
             .abort(message, file_name, line_number, column_number)
             .unwrap_err()
             .into())
@@ -519,9 +434,9 @@ where
         let entity = self.asc_get(entity_ptr);
         let id = self.asc_get(id_ptr);
         let data = self.asc_get(data_ptr);
-        self.valid_module
+        self.ctx
             .host_exports
-            .store_set(&mut self.ctx, entity, id, data)?;
+            .store_set(&mut self.ctx.state, entity, id, data)?;
         Ok(None)
     }
 
@@ -536,9 +451,9 @@ where
         }
         let entity = self.asc_get(entity_ptr);
         let id = self.asc_get(id_ptr);
-        self.valid_module
+        self.ctx
             .host_exports
-            .store_remove(&mut self.ctx, entity, id);
+            .store_remove(&mut self.ctx.state, entity, id);
         Ok(None)
     }
 
@@ -548,14 +463,23 @@ where
         entity_ptr: AscPtr<AscString>,
         id_ptr: AscPtr<AscString>,
     ) -> Result<Option<RuntimeValue>, Trap> {
-        let entity_option = self.host_exports().store_get(
-            &self.ctx,
-            self.asc_get(entity_ptr),
-            self.asc_get(id_ptr),
+        let entity_ptr = self.asc_get(entity_ptr);
+        let id_ptr = self.asc_get(id_ptr);
+        let entity_option = self.ctx.host_exports.store_get(
+            &self.ctx.logger,
+            &mut self.ctx.state,
+            entity_ptr,
+            id_ptr,
         )?;
 
         Ok(Some(match entity_option {
-            Some(entity) => RuntimeValue::from(self.asc_new(&entity)),
+            Some(entity) => {
+                let _section = self
+                    .host_metrics
+                    .stopwatch
+                    .start_section("store_get_asc_new");
+                RuntimeValue::from(self.asc_new(&entity))
+            }
             None => RuntimeValue::from(0),
         }))
     }
@@ -566,10 +490,12 @@ where
         call_ptr: AscPtr<AscUnresolvedContractCall>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let call = self.asc_get(call_ptr);
-        let result = self
-            .valid_module
-            .host_exports
-            .ethereum_call(&mut self.ctx, call)?;
+        let result = self.ctx.host_exports.ethereum_call(
+            &mut self.task_sink,
+            &mut self.ctx.logger,
+            &self.ctx.block,
+            call,
+        )?;
         Ok(Some(match result {
             Some(tokens) => RuntimeValue::from(self.asc_new(tokens.as_slice())),
             None => RuntimeValue::from(0),
@@ -582,7 +508,8 @@ where
         bytes_ptr: AscPtr<Uint8Array>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let string = self
-            .host_exports()
+            .ctx
+            .host_exports
             .bytes_to_string(self.asc_get(bytes_ptr))?;
         Ok(Some(RuntimeValue::from(self.asc_new(&string))))
     }
@@ -593,7 +520,7 @@ where
         &mut self,
         bytes_ptr: AscPtr<Uint8Array>,
     ) -> Result<Option<RuntimeValue>, Trap> {
-        let result = self.host_exports().bytes_to_hex(self.asc_get(bytes_ptr));
+        let result = self.ctx.host_exports.bytes_to_hex(self.asc_get(bytes_ptr));
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
 
@@ -604,7 +531,7 @@ where
     ) -> Result<Option<RuntimeValue>, Trap> {
         let bytes: Vec<u8> = self.asc_get(big_int_ptr);
         let n = BigInt::from_signed_bytes_le(&*bytes);
-        let result = self.host_exports().big_int_to_string(n);
+        let result = self.ctx.host_exports.big_int_to_string(n);
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
 
@@ -614,7 +541,7 @@ where
         big_int_ptr: AscPtr<AscBigInt>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let n: BigInt = self.asc_get(big_int_ptr);
-        let result = self.host_exports().big_int_to_hex(n);
+        let result = self.ctx.host_exports.big_int_to_hex(n);
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
 
@@ -635,7 +562,7 @@ where
     /// function typeConversion.i32ToBigInt(i: i32): Uint64Array
     fn big_int_to_i32(&mut self, n_ptr: AscPtr<AscBigInt>) -> Result<Option<RuntimeValue>, Trap> {
         let n: BigInt = self.asc_get(n_ptr);
-        let i = self.host_exports().big_int_to_i32(n)?;
+        let i = self.ctx.host_exports.big_int_to_i32(n)?;
         Ok(Some(RuntimeValue::from(i)))
     }
 
@@ -645,7 +572,8 @@ where
         bytes_ptr: AscPtr<Uint8Array>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .json_from_bytes(self.asc_get(bytes_ptr))?;
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
@@ -653,7 +581,10 @@ where
     /// function ipfs.cat(link: String): Bytes
     fn ipfs_cat(&mut self, link_ptr: AscPtr<AscString>) -> Result<Option<RuntimeValue>, Trap> {
         let link = self.asc_get(link_ptr);
-        let ipfs_res = self.host_exports().ipfs_cat(&self.ctx.logger, link);
+        let ipfs_res = self
+            .ctx
+            .host_exports
+            .ipfs_cat(&self.ctx.logger, &mut self.task_sink, link);
         match ipfs_res {
             Ok(bytes) => {
                 let bytes_obj: AscPtr<Uint8Array> = self.asc_new(&*bytes);
@@ -662,7 +593,7 @@ where
 
             // Return null in case of error.
             Err(e) => {
-                info!(self.logger, "Failed ipfs.cat, returning `null`";
+                info!(&self.ctx.logger, "Failed ipfs.cat, returning `null`";
                                     "link" => self.asc_get::<String, _>(link_ptr),
                                     "error" => e.to_string());
                 Ok(Some(RuntimeValue::from(0)))
@@ -686,12 +617,13 @@ where
         let start_time = Instant::now();
         let result =
             match self
-                .host_exports()
+                .ctx
+                .host_exports
                 .ipfs_map(&self, link.clone(), &*callback, user_data, flags)
             {
                 Ok(output_states) => {
                     debug!(
-                        self.logger,
+                        &self.ctx.logger,
                         "Successfully processed file with ipfs.map";
                         "link" => &link,
                         "callback" => &*callback,
@@ -701,8 +633,8 @@ where
                     for output_state in output_states {
                         self.ctx
                             .state
-                            .entity_operations
-                            .extend(output_state.entity_operations);
+                            .entity_cache
+                            .extend(output_state.entity_cache);
                         self.ctx
                             .state
                             .created_data_sources
@@ -723,21 +655,21 @@ where
     /// Expects a decimal string.
     /// function json.toI64(json: String): i64
     fn json_to_i64(&mut self, json_ptr: AscPtr<AscString>) -> Result<Option<RuntimeValue>, Trap> {
-        let number = self.host_exports().json_to_i64(self.asc_get(json_ptr))?;
+        let number = self.ctx.host_exports.json_to_i64(self.asc_get(json_ptr))?;
         Ok(Some(RuntimeValue::from(number)))
     }
 
     /// Expects a decimal string.
     /// function json.toU64(json: String): u64
     fn json_to_u64(&mut self, json_ptr: AscPtr<AscString>) -> Result<Option<RuntimeValue>, Trap> {
-        let number = self.host_exports().json_to_u64(self.asc_get(json_ptr))?;
+        let number = self.ctx.host_exports.json_to_u64(self.asc_get(json_ptr))?;
         Ok(Some(RuntimeValue::from(number)))
     }
 
     /// Expects a decimal string.
     /// function json.toF64(json: String): f64
     fn json_to_f64(&mut self, json_ptr: AscPtr<AscString>) -> Result<Option<RuntimeValue>, Trap> {
-        let number = self.host_exports().json_to_f64(self.asc_get(json_ptr))?;
+        let number = self.ctx.host_exports.json_to_f64(self.asc_get(json_ptr))?;
         Ok(Some(RuntimeValue::from(F64::from(number))))
     }
 
@@ -748,7 +680,8 @@ where
         json_ptr: AscPtr<AscString>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let big_int = self
-            .host_exports()
+            .ctx
+            .host_exports
             .json_to_big_int(self.asc_get(json_ptr))?;
         let big_int_ptr: AscPtr<AscBigInt> = self.asc_new(&*big_int);
         Ok(Some(RuntimeValue::from(big_int_ptr)))
@@ -760,7 +693,8 @@ where
         input_ptr: AscPtr<Uint8Array>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let input = self
-            .host_exports()
+            .ctx
+            .host_exports
             .crypto_keccak_256(self.asc_get(input_ptr));
         let hash_ptr: AscPtr<Uint8Array> = self.asc_new(input.as_ref());
         Ok(Some(RuntimeValue::from(hash_ptr)))
@@ -773,7 +707,8 @@ where
         y_ptr: AscPtr<AscBigInt>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_int_plus(self.asc_get(x_ptr), self.asc_get(y_ptr));
         let result_ptr: AscPtr<AscBigInt> = self.asc_new(&result);
         Ok(Some(RuntimeValue::from(result_ptr)))
@@ -786,7 +721,8 @@ where
         y_ptr: AscPtr<AscBigInt>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_int_minus(self.asc_get(x_ptr), self.asc_get(y_ptr));
         let result_ptr: AscPtr<AscBigInt> = self.asc_new(&result);
         Ok(Some(RuntimeValue::from(result_ptr)))
@@ -799,7 +735,8 @@ where
         y_ptr: AscPtr<AscBigInt>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_int_times(self.asc_get(x_ptr), self.asc_get(y_ptr));
         let result_ptr: AscPtr<AscBigInt> = self.asc_new(&result);
         Ok(Some(RuntimeValue::from(result_ptr)))
@@ -812,7 +749,8 @@ where
         y_ptr: AscPtr<AscBigInt>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_int_divided_by(self.asc_get(x_ptr), self.asc_get(y_ptr))?;
         let result_ptr: AscPtr<AscBigInt> = self.asc_new(&result);
         Ok(Some(RuntimeValue::from(result_ptr)))
@@ -826,7 +764,8 @@ where
     ) -> Result<Option<RuntimeValue>, Trap> {
         let x = self.asc_get::<BigInt, _>(x_ptr).to_big_decimal(0.into());
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_decimal_divided_by(x, self.asc_get(y_ptr))?;
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
@@ -838,7 +777,8 @@ where
         y_ptr: AscPtr<AscBigInt>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_int_mod(self.asc_get(x_ptr), self.asc_get(y_ptr));
         let result_ptr: AscPtr<AscBigInt> = self.asc_new(&result);
         Ok(Some(RuntimeValue::from(result_ptr)))
@@ -850,7 +790,7 @@ where
         x_ptr: AscPtr<AscBigInt>,
         exp: u8,
     ) -> Result<Option<RuntimeValue>, Trap> {
-        let result = self.host_exports().big_int_pow(self.asc_get(x_ptr), exp);
+        let result = self.ctx.host_exports.big_int_pow(self.asc_get(x_ptr), exp);
         let result_ptr: AscPtr<AscBigInt> = self.asc_new(&result);
         Ok(Some(RuntimeValue::from(result_ptr)))
     }
@@ -860,7 +800,10 @@ where
         &mut self,
         bytes_ptr: AscPtr<Uint8Array>,
     ) -> Result<Option<RuntimeValue>, Trap> {
-        let result = self.host_exports().bytes_to_base58(self.asc_get(bytes_ptr));
+        let result = self
+            .ctx
+            .host_exports
+            .bytes_to_base58(self.asc_get(bytes_ptr));
         let result_ptr: AscPtr<AscString> = self.asc_new(&result);
         Ok(Some(RuntimeValue::from(result_ptr)))
     }
@@ -871,7 +814,8 @@ where
         big_decimal_ptr: AscPtr<AscBigDecimal>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_decimal_to_string(self.asc_get(big_decimal_ptr));
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
@@ -882,7 +826,8 @@ where
         string_ptr: AscPtr<AscString>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_decimal_from_string(self.asc_get(string_ptr))?;
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
@@ -894,7 +839,8 @@ where
         y_ptr: AscPtr<AscBigDecimal>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_decimal_plus(self.asc_get(x_ptr), self.asc_get(y_ptr));
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
@@ -906,7 +852,8 @@ where
         y_ptr: AscPtr<AscBigDecimal>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_decimal_minus(self.asc_get(x_ptr), self.asc_get(y_ptr));
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
@@ -918,7 +865,8 @@ where
         y_ptr: AscPtr<AscBigDecimal>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_decimal_times(self.asc_get(x_ptr), self.asc_get(y_ptr));
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
@@ -930,7 +878,8 @@ where
         y_ptr: AscPtr<AscBigDecimal>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let result = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_decimal_divided_by(self.asc_get(x_ptr), self.asc_get(y_ptr))?;
         Ok(Some(RuntimeValue::from(self.asc_new(&result))))
     }
@@ -942,7 +891,8 @@ where
         y_ptr: AscPtr<AscBigDecimal>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let equals = self
-            .host_exports()
+            .ctx
+            .host_exports
             .big_decimal_equals(self.asc_get(x_ptr), self.asc_get(y_ptr));
         Ok(Some(RuntimeValue::I32(if equals { 1 } else { 0 })))
     }
@@ -955,10 +905,27 @@ where
     ) -> Result<Option<RuntimeValue>, Trap> {
         let name: String = self.asc_get(name_ptr);
         let params: Vec<String> = self.asc_get(params_ptr);
-        self.valid_module
-            .host_exports
-            .data_source_create(&mut self.ctx, name, params)?;
+        self.ctx.host_exports.data_source_create(
+            &self.ctx.logger,
+            &mut self.ctx.state,
+            name,
+            params,
+        )?;
         Ok(None)
+    }
+
+    /// function dataSource.address(): Bytes
+    fn data_source_address(&mut self) -> Result<Option<RuntimeValue>, Trap> {
+        Ok(Some(RuntimeValue::from(
+            self.asc_new(&self.ctx.host_exports.data_source_address()),
+        )))
+    }
+
+    /// function dataSource.network(): String
+    fn data_source_network(&mut self) -> Result<Option<RuntimeValue>, Trap> {
+        Ok(Some(RuntimeValue::from(
+            self.asc_new(&self.ctx.host_exports.data_source_network()),
+        )))
     }
 
     fn ens_name_by_hash(
@@ -966,7 +933,7 @@ where
         hash_ptr: AscPtr<AscString>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         let hash: String = self.asc_get(hash_ptr);
-        let name = self.valid_module.host_exports.ens_name_by_hash(&*hash)?;
+        let name = self.ctx.host_exports.ens_name_by_hash(&*hash)?;
         // map `None` to `null`, and `Some(s)` to a runtime string
         Ok(name
             .map(|name| RuntimeValue::from(self.asc_new(&*name)))
@@ -980,18 +947,13 @@ where
     ) -> Result<Option<RuntimeValue>, Trap> {
         let level = LogLevel::from(level).into();
         let msg: String = self.asc_get(msg);
-        self.valid_module
-            .host_exports
-            .log_log(&self.ctx, level, msg);
+        self.ctx.host_exports.log_log(&self.ctx.logger, level, msg);
         Ok(None)
     }
 }
 
-impl<T, L, S, U> Externals for WasmiModule<T, L, S, U>
+impl<U> Externals for WasmiModule<U>
 where
-    T: EthereumAdapter,
-    L: LinkResolver,
-    S: Store + Send + Sync + 'static,
     U: Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>
         + Clone
         + Send
@@ -1003,23 +965,41 @@ where
         index: usize,
         args: RuntimeArgs,
     ) -> Result<Option<RuntimeValue>, Trap> {
-        match index {
+        // This function is hot, so avoid the cost of registering metrics.
+        if index == GAS_FUNC_INDEX {
+            return self.gas();
+        }
+
+        // Start a catch-all section for exports that don't have their own section.
+        let stopwatch = self.host_metrics.stopwatch.clone();
+        let _section = stopwatch.start_section("host_export_other");
+        let start = Instant::now();
+        let res = match index {
             ABORT_FUNC_INDEX => self.abort(
                 args.nth_checked(0)?,
                 args.nth_checked(1)?,
                 args.nth_checked(2)?,
                 args.nth_checked(3)?,
             ),
-            STORE_SET_FUNC_INDEX => self.store_set(
-                args.nth_checked(0)?,
-                args.nth_checked(1)?,
-                args.nth_checked(2)?,
-            ),
-            STORE_GET_FUNC_INDEX => self.store_get(args.nth_checked(0)?, args.nth_checked(1)?),
+            STORE_SET_FUNC_INDEX => {
+                let _section = stopwatch.start_section("host_export_store_set");
+                self.store_set(
+                    args.nth_checked(0)?,
+                    args.nth_checked(1)?,
+                    args.nth_checked(2)?,
+                )
+            }
+            STORE_GET_FUNC_INDEX => {
+                let _section = stopwatch.start_section("host_export_store_get");
+                self.store_get(args.nth_checked(0)?, args.nth_checked(1)?)
+            }
             STORE_REMOVE_FUNC_INDEX => {
                 self.store_remove(args.nth_checked(0)?, args.nth_checked(1)?)
             }
-            ETHEREUM_CALL_FUNC_INDEX => self.ethereum_call(args.nth_checked(0)?),
+            ETHEREUM_CALL_FUNC_INDEX => {
+                let _section = stopwatch.start_section("host_export_ethereum_call");
+                self.ethereum_call(args.nth_checked(0)?)
+            }
             TYPE_CONVERSION_BYTES_TO_STRING_FUNC_INDEX => {
                 self.bytes_to_string(args.nth_checked(0)?)
             }
@@ -1036,7 +1016,10 @@ where
             JSON_TO_U64_FUNC_INDEX => self.json_to_u64(args.nth_checked(0)?),
             JSON_TO_F64_FUNC_INDEX => self.json_to_f64(args.nth_checked(0)?),
             JSON_TO_BIG_INT_FUNC_INDEX => self.json_to_big_int(args.nth_checked(0)?),
-            IPFS_CAT_FUNC_INDEX => self.ipfs_cat(args.nth_checked(0)?),
+            IPFS_CAT_FUNC_INDEX => {
+                let _section = stopwatch.start_section("host_export_ipfs_cat");
+                self.ipfs_cat(args.nth_checked(0)?)
+            }
             CRYPTO_KECCAK_256_INDEX => self.crypto_keccak_256(args.nth_checked(0)?),
             BIG_INT_PLUS => self.big_int_plus(args.nth_checked(0)?, args.nth_checked(1)?),
             BIG_INT_MINUS => self.big_int_minus(args.nth_checked(0)?, args.nth_checked(1)?),
@@ -1049,7 +1032,6 @@ where
             }
             BIG_INT_MOD => self.big_int_mod(args.nth_checked(0)?, args.nth_checked(1)?),
             BIG_INT_POW => self.big_int_pow(args.nth_checked(0)?, args.nth_checked(1)?),
-            GAS_FUNC_INDEX => self.gas(args.nth_checked(0)?),
             TYPE_CONVERSION_BYTES_TO_BASE_58_INDEX => self.bytes_to_base58(args.nth_checked(0)?),
             BIG_DECIMAL_PLUS => self.big_decimal_plus(args.nth_checked(0)?, args.nth_checked(1)?),
             BIG_DECIMAL_MINUS => self.big_decimal_minus(args.nth_checked(0)?, args.nth_checked(1)?),
@@ -1062,19 +1044,30 @@ where
             }
             BIG_DECIMAL_TO_STRING => self.big_decimal_to_string(args.nth_checked(0)?),
             BIG_DECIMAL_FROM_STRING => self.big_decimal_from_string(args.nth_checked(0)?),
-            IPFS_MAP_FUNC_INDEX => self.ipfs_map(
-                args.nth_checked(0)?,
-                args.nth_checked(1)?,
-                args.nth_checked(2)?,
-                args.nth_checked(3)?,
-            ),
+            IPFS_MAP_FUNC_INDEX => {
+                let _section = stopwatch.start_section("host_export_ipfs_map");
+                self.ipfs_map(
+                    args.nth_checked(0)?,
+                    args.nth_checked(1)?,
+                    args.nth_checked(2)?,
+                    args.nth_checked(3)?,
+                )
+            }
             DATA_SOURCE_CREATE_INDEX => {
                 self.data_source_create(args.nth_checked(0)?, args.nth_checked(1)?)
             }
             ENS_NAME_BY_HASH => self.ens_name_by_hash(args.nth_checked(0)?),
             LOG_LOG => self.log_log(args.nth_checked(0)?, args.nth_checked(1)?),
+            DATA_SOURCE_ADDRESS => self.data_source_address(),
+            DATA_SOURCE_NETWORK => self.data_source_network(),
             _ => panic!("Unimplemented function at {}", index),
-        }
+        };
+        // Record execution time
+        fn_index_to_metrics_string(index).map(|name| {
+            self.host_metrics
+                .observe_host_fn_execution_time(start.elapsed().as_secs_f64(), name);
+        });
+        res
     }
 }
 
@@ -1172,6 +1165,8 @@ impl ModuleImportResolver for ModuleResolver {
 
             // dataSource
             "dataSource.create" => FuncInstance::alloc_host(signature, DATA_SOURCE_CREATE_INDEX),
+            "dataSource.address" => FuncInstance::alloc_host(signature, DATA_SOURCE_ADDRESS),
+            "dataSource.network" => FuncInstance::alloc_host(signature, DATA_SOURCE_NETWORK),
 
             // ens.nameByHash
             "ens.nameByHash" => FuncInstance::alloc_host(signature, ENS_NAME_BY_HASH),

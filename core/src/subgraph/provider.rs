@@ -8,6 +8,7 @@ use graph::prelude::{
     SubgraphAssignmentProvider as SubgraphAssignmentProviderTrait, *,
 };
 
+use crate::subgraph::registrar::IPFS_SUBGRAPH_LOADING_TIMEOUT;
 use crate::DataSourceLoader;
 
 pub struct SubgraphAssignmentProvider<L, Q, S> {
@@ -23,7 +24,7 @@ pub struct SubgraphAssignmentProvider<L, Q, S> {
 
 impl<L, Q, S> SubgraphAssignmentProvider<L, Q, S>
 where
-    L: LinkResolver,
+    L: LinkResolver + Clone,
     Q: GraphQlRunner,
     S: Store,
 {
@@ -44,7 +45,13 @@ where
             logger_factory,
             event_stream: Some(event_stream),
             event_sink,
-            resolver,
+            resolver: Arc::new(
+                resolver
+                    .as_ref()
+                    .clone()
+                    .with_timeout(*IPFS_SUBGRAPH_LOADING_TIMEOUT)
+                    .with_retries(),
+            ),
             subgraphs_running: Arc::new(Mutex::new(HashSet::new())),
             store,
             graphql_runner,
@@ -68,7 +75,7 @@ where
 
 impl<L, Q, S> SubgraphAssignmentProviderTrait for SubgraphAssignmentProvider<L, Q, S>
 where
-    L: LinkResolver,
+    L: LinkResolver + Clone,
     Q: GraphQlRunner,
     S: Store + SubgraphDeploymentStore,
 {
@@ -141,7 +148,7 @@ where
                         self_clone
                             .store
                             .clone()
-                            .build_entity_attribute_indexes(index_definitions)
+                            .build_entity_attribute_indexes(&subgraph.id, index_definitions)
                             .map(|_| {
                                 info!(
                                     logger,
@@ -168,9 +175,8 @@ where
                         "error" => format!("{}", e)
                     );
 
-                    let _ = store.apply_entity_operations(
+                    let _ = store.apply_metadata_operations(
                         SubgraphDeploymentEntity::update_failed_operations(&subgraph_id, true),
-                        None,
                     );
                     e
                 }),

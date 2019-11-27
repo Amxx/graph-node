@@ -1,9 +1,10 @@
 use diesel::dsl::{self, sql};
 use diesel::pg::Pg;
 use diesel::prelude::*;
-use diesel::query_builder::BoxedSelectStatement;
 use diesel::serialize::ToSql;
 use diesel::sql_types::{Array, Bool, Double, HasSqlType, Integer, Numeric, Text};
+use std::error::Error as StdError;
+use std::fmt::{self, Display};
 use std::str::FromStr;
 
 use graph::components::store::EntityFilter;
@@ -20,6 +21,24 @@ pub(crate) struct UnsupportedFilter {
     pub value: Value,
 }
 
+impl Display for UnsupportedFilter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(
+            f,
+            "unsupported filter `{}` for value `{}`",
+            self.filter, self.value
+        )
+    }
+}
+
+impl StdError for UnsupportedFilter {}
+
+impl From<UnsupportedFilter> for diesel::result::Error {
+    fn from(error: UnsupportedFilter) -> Self {
+        diesel::result::Error::QueryBuilderError(Box::new(error))
+    }
+}
+
 type FilterExpression<QS> = Box<dyn BoxableExpression<QS, Pg, SqlType = Bool>>;
 
 trait IntoFilter<QS> {
@@ -28,28 +47,34 @@ trait IntoFilter<QS> {
 
 impl<QS> IntoFilter<QS> for String {
     fn into_filter(self, attribute: String, op: &str) -> FilterExpression<QS> {
-        // Generate
-        //  (left(attribute, prefix_size) op left(self, prefix_size) and attribute op self)
-        // The first condition is there to make the index on attribute usable,
-        // the second so that we only return correct results
-        Box::new(
-            sql("(left(data -> ")
-                .bind::<Text, _>(attribute.clone())
-                .sql("->> 'data', ")
-                .sql(&STRING_PREFIX_SIZE.to_string())
-                .sql(") ")
-                .sql(op)
-                .sql(" left(")
-                .bind::<Text, _>(self.clone())
-                .sql(", ")
-                .sql(&STRING_PREFIX_SIZE.to_string())
-                .sql(") and data -> ")
-                .bind::<Text, _>(attribute)
-                .sql("->> 'data' ")
-                .sql(op)
-                .bind::<Text, _>(self)
-                .sql(")"),
-        ) as FilterExpression<QS>
+        if &attribute == "id" {
+            // Use the `id` column rather than `data->'id'->>'data'` so that
+            // Postgres can use the primary key index on the entities table
+            Box::new(sql("id").sql(op).bind::<Text, _>(self)) as FilterExpression<QS>
+        } else {
+            // Generate
+            //  (left(attribute, prefix_size) op left(self, prefix_size) and attribute op self)
+            // The first condition is there to make the index on attribute usable,
+            // the second so that we only return correct results
+            Box::new(
+                sql("(left(data -> ")
+                    .bind::<Text, _>(attribute.clone())
+                    .sql("->> 'data', ")
+                    .sql(&STRING_PREFIX_SIZE.to_string())
+                    .sql(") ")
+                    .sql(op)
+                    .sql(" left(")
+                    .bind::<Text, _>(self.clone())
+                    .sql(", ")
+                    .sql(&STRING_PREFIX_SIZE.to_string())
+                    .sql(") and data -> ")
+                    .bind::<Text, _>(attribute)
+                    .sql("->> 'data' ")
+                    .sql(op)
+                    .bind::<Text, _>(self)
+                    .sql(")"),
+            ) as FilterExpression<QS>
+        }
     }
 }
 
@@ -155,17 +180,6 @@ impl<QS> IntoArrayFilter<QS, SqlValue> for Vec<SqlValue> {
                 .sql(")"),
         ) as FilterExpression<QS>
     }
-}
-
-/// Adds `filter` to a `SELECT data FROM entities` statement.
-pub(crate) fn store_filter<QS, ST>(
-    query: BoxedSelectStatement<ST, QS, Pg>,
-    filter: EntityFilter,
-) -> Result<BoxedSelectStatement<ST, QS, Pg>, UnsupportedFilter>
-where
-    QS: EntitySource + 'static,
-{
-    Ok(query.filter(build_filter(filter)?))
 }
 
 pub(crate) fn build_filter<QS>(

@@ -29,6 +29,9 @@ where
 
     /// Maximum depth for a query.
     pub max_depth: u8,
+
+    /// Maximum value for the `first` argument.
+    pub max_first: u32,
 }
 
 /// Executes a query and returns a result.
@@ -64,17 +67,21 @@ where
         fields: vec![],
         variable_values: Arc::new(coerced_variable_values),
         deadline: options.deadline,
+        max_first: options.max_first,
     };
 
     let result = match operation {
         // Execute top-level `query { ... }` and `{ ... }` expressions.
         q::OperationDefinition::Query(q::Query { selection_set, .. })
         | q::OperationDefinition::SelectionSet(selection_set) => {
-            let complexity = ctx.root_query_complexity(
-                sast::get_root_query_type_def(&ctx.schema.document).unwrap(),
-                selection_set,
-                options.max_depth,
-            );
+            let root_type = sast::get_root_query_type_def(&ctx.schema.document).unwrap();
+            let validation_errors =
+                ctx.validate_fields(&"Query".to_owned(), root_type, selection_set);
+            if !validation_errors.is_empty() {
+                return QueryResult::from(validation_errors);
+            }
+
+            let complexity = ctx.root_query_complexity(root_type, selection_set, options.max_depth);
 
             info!(
                 query_logger,

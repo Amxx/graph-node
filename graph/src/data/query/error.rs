@@ -36,7 +36,7 @@ pub enum QueryExecutionError {
     EmptyQuery,
     MultipleSubscriptionFields,
     SubgraphDeploymentIdError(String),
-    RangeArgumentsError(Vec<&'static str>, u64),
+    RangeArgumentsError(Vec<&'static str>, u32),
     InvalidFilterError,
     EntityFieldError(String, String),
     ListTypesError(String, Vec<String>),
@@ -53,6 +53,7 @@ pub enum QueryExecutionError {
     ScalarCoercionError(Pos, String, q::Value, String),
     TooComplex(u64, u64), // (complexity, max_complexity)
     TooDeep(u8),          // max_depth
+    UndefinedFragment(String),
 }
 
 impl Error for QueryExecutionError {
@@ -191,7 +192,8 @@ impl fmt::Display for QueryExecutionError {
                            of the query, querying fewer relationships or using `first` to \
                            return smaller collections", complexity, max_complexity)
             }
-            TooDeep(max_depth) => write!(f, "query has a depth that exceeds the limit of `{}`", max_depth)
+            TooDeep(max_depth) => write!(f, "query has a depth that exceeds the limit of `{}`", max_depth),
+            UndefinedFragment(frag_name) => write!(f, "fragment `{}` is not defined", frag_name),
         }
     }
 }
@@ -331,7 +333,8 @@ impl Serialize for QueryError {
             | QueryError::ExecutionError(MissingVariableError(pos, _))
             | QueryError::ExecutionError(AmbiguousDerivedFromResult(pos, _, _, _))
             | QueryError::ExecutionError(EnumCoercionError(pos, _, _, _, _))
-            | QueryError::ExecutionError(ScalarCoercionError(pos, _, _, _)) => {
+            | QueryError::ExecutionError(ScalarCoercionError(pos, _, _, _))
+            | QueryError::ExecutionError(UnknownField(pos, _, _)) => {
                 let mut location = HashMap::new();
                 location.insert("line", pos.line);
                 location.insert("column", pos.column);

@@ -33,17 +33,7 @@ impl EventConsumer<ChainHeadUpdate> for MockBlockStream {
     }
 }
 
-impl BlockStream for MockBlockStream {
-    fn parse_triggers(
-        _: EthereumLogFilter,
-        _: EthereumCallFilter,
-        _: EthereumBlockFilter,
-        _include_calls_in_blocks: bool,
-        _descendant_block: EthereumBlockWithCalls,
-    ) -> Result<EthereumBlockWithTriggers, Error> {
-        unimplemented!()
-    }
-}
+impl BlockStream for MockBlockStream {}
 
 #[derive(Clone)]
 pub struct MockBlockStreamBuilder;
@@ -62,10 +52,12 @@ impl BlockStreamBuilder for MockBlockStreamBuilder {
         _logger: Logger,
         _deployment_id: SubgraphDeploymentId,
         _network_name: String,
+        _start_blocks: Vec<u64>,
         _: EthereumLogFilter,
         _: EthereumCallFilter,
         _: EthereumBlockFilter,
-        _include_calls_in_blocks: bool,
+        _: bool,
+        _: Arc<BlockStreamMetrics>,
     ) -> Self::Stream {
         MockBlockStream::new()
     }

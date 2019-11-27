@@ -12,7 +12,7 @@ RUN apt-get update \
 RUN git clone https://github.com/graphprotocol/graph-node \
     && cd graph-node \
     && git checkout "$SOURCE_BRANCH" \
-    && cargo install --path node \
+    && cargo install --locked --path node \
     && cd .. \
     && rm -rf graph-node
 
@@ -46,7 +46,21 @@ EXPOSE 8020
 
 # Start everything on startup
 ADD start-node /usr/local/bin
-CMD wait-for-it.sh $ipfs -t 30 \
-    && wait-for-it.sh $postgres_host -t 30 \
+
+RUN apt-get install gawk
+
+# Wait for IPFS and Postgres to start up.
+#
+# The awk commands below take the IPFS and Postgres and extract
+# hostname:port from them. The IPFS port defaults to 443 for HTTPS
+# and 80 for HTTP. The Postgres port defaults to 5432.
+CMD wait-for-it.sh \
+      $(echo $ipfs | \
+        gawk 'match($0, /^([a-z]+:\/\/)?([^\/:]+)(:([0-9]+))?.*$/, m) { print m[2]":"(m[4] ? m[4] : (m[1] == "https://" ? 443 : 80)) }') \
+      -t 30 \
+    && wait-for-it.sh \
+         $(echo $postgres_host | \
+           gawk 'match($0, /^([a-z]+:\/\/)?([^\/:]+)(:([0-9]+))?.*$/, m) { print m[2]":"(m[4] ? m[4] : 5432) }') \
+         -t 30 \
     && sleep 5 \
     && start-node

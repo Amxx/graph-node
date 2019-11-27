@@ -4,32 +4,30 @@ use std::time::Instant;
 use graph::prelude::*;
 use web3::types::*;
 
-pub struct BlockIngestor<S, E>
+pub struct BlockIngestor<S>
 where
     S: ChainStore,
-    E: EthereumAdapter,
 {
     chain_store: Arc<S>,
-    eth_adapter: Arc<E>,
+    eth_adapter: Arc<dyn EthereumAdapter>,
     ancestor_count: u64,
     network_name: String,
     logger: Logger,
     polling_interval: Duration,
 }
 
-impl<S, E> BlockIngestor<S, E>
+impl<S> BlockIngestor<S>
 where
     S: ChainStore,
-    E: EthereumAdapter,
 {
     pub fn new(
         chain_store: Arc<S>,
-        eth_adapter: Arc<E>,
+        eth_adapter: Arc<dyn EthereumAdapter>,
         ancestor_count: u64,
         network_name: String,
         logger_factory: &LoggerFactory,
         polling_interval: Duration,
-    ) -> Result<BlockIngestor<S, E>, Error> {
+    ) -> Result<BlockIngestor<S>, Error> {
         let logger = logger_factory.component_logger(
             "BlockIngestor",
             Some(ComponentLoggerConfig {
@@ -97,7 +95,7 @@ where
                 // Ask for latest block from Ethereum node
                 self.eth_adapter.latest_block(&self.logger)
                     // Compare latest block with head ptr, alert user if far behind
-                    .and_then(move |latest_block: Block<Transaction>| -> Box<dyn Future<Item=_, Error=_> + Send> {
+                    .and_then(move |latest_block: LightEthereumBlock| -> Box<dyn Future<Item=_, Error=_> + Send> {
                         match head_block_ptr_opt {
                             None => {
                                 info!(

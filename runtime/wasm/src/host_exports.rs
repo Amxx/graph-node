@@ -1,6 +1,5 @@
-use crate::MappingContext;
 use crate::UnresolvedContractCall;
-use ethabi::Token;
+use ethabi::{Address, Token};
 use futures::sync::oneshot;
 use graph::components::ethereum::*;
 use graph::components::store::EntityKey;
@@ -10,10 +9,11 @@ use graph::prelude::{slog::b, slog::record_static, *};
 use semver::Version;
 use std::collections::HashMap;
 use std::fmt;
-use std::ops::Deref;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use web3::types::H160;
+
+use graph_graphql::prelude::validate_entity;
 
 use crate::module::WasmiModule;
 
@@ -37,52 +37,55 @@ impl From<graph::prelude::Error> for HostExportError<String> {
     }
 }
 
-pub(crate) struct HostExports<E, L, S, U> {
+pub(crate) struct HostExports {
     subgraph_id: SubgraphDeploymentId,
-    pub api_version: Version,
+    pub(crate) api_version: Version,
     data_source_name: String,
+    data_source_address: Option<Address>,
+    data_source_network: Option<String>,
     templates: Vec<DataSourceTemplate>,
     abis: Vec<MappingABI>,
-    ethereum_adapter: Arc<E>,
-    link_resolver: Arc<L>,
-    store: Arc<S>,
-    task_sink: U,
+    ethereum_adapter: Arc<dyn EthereumAdapter>,
+    link_resolver: Arc<dyn LinkResolver>,
+    call_cache: Arc<dyn EthereumCallCache>,
+    store: Arc<dyn crate::RuntimeStore>,
     handler_timeout: Option<Duration>,
 }
 
-impl<E, L, S, U> HostExports<E, L, S, U>
-where
-    E: EthereumAdapter,
-    L: LinkResolver,
-    S: Store + Send + Sync,
-    U: Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
+// Not meant to be useful, only to allow deriving.
+impl std::fmt::Debug for HostExports {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "HostExports",)
+    }
+}
+
+impl HostExports {
     pub(crate) fn new(
         subgraph_id: SubgraphDeploymentId,
         api_version: Version,
         data_source_name: String,
+        data_source_address: Option<Address>,
+        data_source_network: Option<String>,
         templates: Vec<DataSourceTemplate>,
         abis: Vec<MappingABI>,
-        ethereum_adapter: Arc<E>,
-        link_resolver: Arc<L>,
-        store: Arc<S>,
-        task_sink: U,
+        ethereum_adapter: Arc<dyn EthereumAdapter>,
+        link_resolver: Arc<dyn LinkResolver>,
+        store: Arc<dyn crate::RuntimeStore>,
+        call_cache: Arc<dyn EthereumCallCache>,
         handler_timeout: Option<Duration>,
     ) -> Self {
-        HostExports {
+        Self {
             subgraph_id,
             api_version,
             data_source_name,
+            data_source_address,
+            data_source_network,
             templates,
             abis,
             ethereum_adapter,
             link_resolver,
+            call_cache,
             store,
-            task_sink,
             handler_timeout,
         }
     }
@@ -117,7 +120,7 @@ where
 
     pub(crate) fn store_set(
         &self,
-        ctx: &mut MappingContext,
+        state: &mut BlockState,
         entity_type: String,
         entity_id: String,
         mut data: HashMap<String, Value>,
@@ -134,36 +137,47 @@ where
             _ => (),
         }
 
-        ctx.state.entity_operations.push(EntityOperation::Set {
-            key: EntityKey {
-                subgraph_id: self.subgraph_id.clone(),
-                entity_type,
-                entity_id,
-            },
-            data: Entity::from(data),
-        });
+        let key = EntityKey {
+            subgraph_id: self.subgraph_id.clone(),
+            entity_type,
+            entity_id,
+        };
+        let entity = Entity::from(data);
+        let schema = self.store.input_schema(&self.subgraph_id)?;
+        let is_valid = validate_entity(&schema.document, &key, &entity).is_ok();
+        state.entity_cache.set(key.clone(), entity);
 
+        // Validate the changes against the subgraph schema.
+        // If the set of fields we have is already valid, avoid hitting the DB.
+        if !is_valid && self.store.uses_relational_schema(&self.subgraph_id)? {
+            let entity = state
+                .entity_cache
+                .get(self.store.as_ref(), &key)
+                .map_err(|e| HostExportError(e.to_string()))?
+                .expect("we just stored this entity");
+            validate_entity(&schema.document, &key, &entity)?;
+        }
         Ok(())
     }
 
     pub(crate) fn store_remove(
         &self,
-        ctx: &mut MappingContext,
+        state: &mut BlockState,
         entity_type: String,
         entity_id: String,
     ) {
-        ctx.state.entity_operations.push(EntityOperation::Remove {
-            key: EntityKey {
-                subgraph_id: self.subgraph_id.clone(),
-                entity_type,
-                entity_id,
-            },
-        });
+        let key = EntityKey {
+            subgraph_id: self.subgraph_id.clone(),
+            entity_type,
+            entity_id,
+        };
+        state.entity_cache.remove(key);
     }
 
     pub(crate) fn store_get(
         &self,
-        ctx: &MappingContext,
+        logger: &Logger,
+        state: &mut BlockState,
         entity_type: String,
         entity_id: String,
     ) -> Result<Option<Entity>, HostExportError<impl ExportError>> {
@@ -174,47 +188,14 @@ where
             entity_id: entity_id.clone(),
         };
 
-        // Get all operations for this entity
-        let matching_operations: Vec<_> = ctx
-            .state
-            .entity_operations
-            .iter()
-            .filter(|op| op.matches_entity(&store_key))
-            .collect();
+        let result = state
+            .entity_cache
+            .get(self.store.as_ref(), &store_key)
+            .map_err(HostExportError)
+            .map(|ok| ok.to_owned());
 
-        // Shortcut 1: If the latest operation for this entity was a removal,
-        // return 0 (= null) to the runtime
-        if matching_operations
-            .iter()
-            .peekable()
-            .peek()
-            .map(|op| op.is_remove())
-            .unwrap_or(false)
-        {
-            return Ok(None);
-        }
-
-        // Shortcut 2: If there is a removal in the operations, the
-        // entity will be the result of the operations after that, so we
-        // don't have to hit the store for anything
-        if matching_operations.iter().any(|op| op.is_remove()) {
-            return EntityOperation::apply_all(None, &matching_operations)
-                .map_err(QueryExecutionError::StoreError)
-                .map_err(HostExportError);
-        }
-
-        // No removal in the operations => read the entity from the store, then apply
-        // the operations to it to obtain the result
-        let result = self
-            .store
-            .get(store_key)
-            .and_then(|entity| {
-                EntityOperation::apply_all(entity, &matching_operations)
-                    .map_err(QueryExecutionError::StoreError)
-            })
-            .map_err(HostExportError);
-        debug!(ctx.logger, "Store get finished";
-               "type" => &entity_type, 
+        debug!(logger, "Store get finished";
+               "type" => &entity_type,
                "id" => &entity_id,
                "time" => format!("{}ms", start_time.elapsed().as_millis()));
         result
@@ -223,7 +204,9 @@ where
     /// Returns `Ok(None)` if the call was reverted.
     pub(crate) fn ethereum_call(
         &self,
-        ctx: &MappingContext,
+        task_sink: &mut impl Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>,
+        logger: &Logger,
+        block: &LightEthereumBlock,
         unresolved_call: UnresolvedContractCall,
     ) -> Result<Option<Vec<Token>>, HostExportError<impl ExportError>> {
         let start_time = Instant::now();
@@ -254,20 +237,22 @@ where
 
         let call = EthereumContractCall {
             address: unresolved_call.contract_address.clone(),
-            block_ptr: ctx.block.as_ref().deref().into(),
+            block_ptr: block.into(),
             function: function.clone(),
             args: unresolved_call.function_args.clone(),
         };
 
         // Run Ethereum call in tokio runtime
         let eth_adapter = self.ethereum_adapter.clone();
-        let logger = ctx.logger.clone();
-        let result = match self.block_on(future::lazy(move || {
-            eth_adapter.contract_call(&logger, call)
-        })) {
+        let logger1 = logger.clone();
+        let call_cache = self.call_cache.clone();
+        let result = match block_on(
+            task_sink,
+            future::lazy(move || eth_adapter.contract_call(&logger1, call, call_cache)),
+        ) {
             Ok(tokens) => Ok(Some(tokens)),
             Err(EthereumContractCallError::Revert(reason)) => {
-                info!(ctx.logger, "Contract call reverted"; "reason" => reason);
+                info!(logger, "Contract call reverted"; "reason" => reason);
                 Ok(None)
             }
             Err(e) => Err(HostExportError(format!(
@@ -276,7 +261,7 @@ where
             ))),
         };
 
-        debug!(ctx.logger, "Contract call finished";
+        debug!(logger, "Contract call finished";
               "address" => &unresolved_call.contract_address.to_string(),
               "contract" => &unresolved_call.contract_name,
               "function" => &unresolved_call.function_name,
@@ -366,9 +351,11 @@ where
     pub(crate) fn ipfs_cat(
         &self,
         logger: &Logger,
+        task_sink: &mut impl Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>,
         link: String,
     ) -> Result<Vec<u8>, HostExportError<impl ExportError>> {
-        self.block_on(
+        block_on(
+            task_sink,
             self.link_resolver
                 .cat(logger, &Link { link })
                 .map_err(HostExportError),
@@ -382,19 +369,28 @@ where
     // which is identical to `module` when it was first started. The signature
     // of the callback must be `callback(JSONValue, Value)`, and the `userData`
     // parameter is passed to the callback without any changes
-    pub(crate) fn ipfs_map(
+    pub(crate) fn ipfs_map<U>(
         &self,
-        module: &WasmiModule<E, L, S, U>,
+        module: &WasmiModule<U>,
         link: String,
         callback: &str,
         user_data: store::Value,
         flags: Vec<String>,
-    ) -> Result<Vec<BlockState>, HostExportError<impl ExportError>> {
+    ) -> Result<Vec<BlockState>, HostExportError<impl ExportError>>
+    where
+        U: Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
         const JSON_FLAG: &str = "json";
         if !flags.contains(&JSON_FLAG.to_string()) {
             return Err(HostExportError(format!("Flags must contain 'json'")));
         }
 
+        let host_metrics = module.host_metrics.clone();
+        let task_sink = module.task_sink.clone();
         let valid_module = module.valid_module.clone();
         let ctx = module.ctx.clone();
         let callback = callback.to_owned();
@@ -407,7 +403,8 @@ where
         let start = Instant::now();
         let mut last_log = Instant::now();
         let logger = ctx.logger.new(o!("ipfs_map" => link.clone()));
-        self.block_on(
+        block_on(
+            &mut task_sink.clone(),
             self.link_resolver
                 .json_stream(&Link { link })
                 .and_then(move |stream| {
@@ -416,6 +413,8 @@ where
                             let module = WasmiModule::from_valid_module_with_ctx(
                                 valid_module.clone(),
                                 ctx.clone(),
+                                task_sink.clone(),
+                                host_metrics.clone(),
                             )?;
                             let result =
                                 module.handle_json_callback(&*callback, &sv.value, &user_data);
@@ -475,7 +474,7 @@ where
     }
 
     pub(crate) fn crypto_keccak_256(&self, input: Vec<u8>) -> [u8; 32] {
-        ::tiny_keccak::keccak256(&input)
+        tiny_keccak::keccak256(&input)
     }
 
     pub(crate) fn big_int_plus(&self, x: BigInt, y: BigInt) -> BigInt {
@@ -511,22 +510,6 @@ where
     /// Limited to a small exponent to avoid creating huge BigInts.
     pub(crate) fn big_int_pow(&self, x: BigInt, exponent: u8) -> BigInt {
         x.pow(exponent)
-    }
-
-    pub(crate) fn block_on<I: Send + 'static, ER: Send + 'static>(
-        &self,
-        future: impl Future<Item = I, Error = ER> + Send + 'static,
-    ) -> Result<I, ER> {
-        let (return_sender, return_receiver) = oneshot::channel();
-        self.task_sink
-            .clone()
-            .send(Box::new(future.then(|res| {
-                return_sender.send(res).map_err(|_| unreachable!())
-            })))
-            .wait()
-            .map_err(|_| panic!("task receiver dropped"))
-            .unwrap();
-        return_receiver.wait().expect("`return_sender` dropped")
     }
 
     pub(crate) fn check_timeout(
@@ -592,12 +575,13 @@ where
 
     pub(crate) fn data_source_create(
         &self,
-        ctx: &mut MappingContext,
+        logger: &Logger,
+        state: &mut BlockState,
         name: String,
         params: Vec<String>,
     ) -> Result<(), HostExportError<impl ExportError>> {
         info!(
-            ctx.logger,
+            logger,
             "Create data source";
             "name" => &name,
             "params" => format!("{}", params.join(","))
@@ -625,7 +609,7 @@ where
             .clone();
 
         // Remember that we need to create this data source
-        ctx.state.created_data_sources.push(DataSourceTemplateInfo {
+        state.created_data_sources.push(DataSourceTemplateInfo {
             data_source: self.data_source_name.clone(),
             template,
             params,
@@ -641,10 +625,10 @@ where
         self.store.find_ens_name(hash).map_err(HostExportError)
     }
 
-    pub(crate) fn log_log(&self, ctx: &MappingContext, level: slog::Level, msg: String) {
+    pub(crate) fn log_log(&self, logger: &Logger, level: slog::Level, msg: String) {
         let rs = record_static!(level, self.data_source_name.as_str());
 
-        ctx.logger.log(&slog::Record::new(
+        logger.log(&slog::Record::new(
             &rs,
             &format_args!("{}", msg),
             b!("data_source" => &self.data_source_name),
@@ -653,6 +637,14 @@ where
         if level == slog::Level::Critical {
             panic!("Critical error logged in mapping");
         }
+    }
+
+    pub(crate) fn data_source_address(&self) -> H160 {
+        self.data_source_address.clone().unwrap_or_default()
+    }
+
+    pub(crate) fn data_source_network(&self) -> String {
+        self.data_source_network.clone().unwrap_or_default()
     }
 }
 
@@ -669,4 +661,19 @@ fn test_string_to_h160_with_0x() {
         H160::from_str("A16081F360e3847006dB660bae1c6d1b2e17eC2A").unwrap(),
         string_to_h160("0xA16081F360e3847006dB660bae1c6d1b2e17eC2A").unwrap()
     )
+}
+
+fn block_on<I: Send + 'static, ER: Send + 'static>(
+    task_sink: &mut impl Sink<SinkItem = Box<dyn Future<Item = (), Error = ()> + Send>>,
+    future: impl Future<Item = I, Error = ER> + Send + 'static,
+) -> Result<I, ER> {
+    let (return_sender, return_receiver) = oneshot::channel();
+    task_sink
+        .send(Box::new(future.then(|res| {
+            return_sender.send(res).map_err(|_| unreachable!())
+        })))
+        .wait()
+        .map_err(|_| panic!("task receiver dropped"))
+        .unwrap();
+    return_receiver.wait().expect("`return_sender` dropped")
 }

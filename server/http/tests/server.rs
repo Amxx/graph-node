@@ -28,6 +28,8 @@ impl GraphQlRunner for TestGraphQlRunner {
         &self,
         _query: Query,
         _complexity: Option<u64>,
+        _max_depth: Option<u8>,
+        _max_first: Option<u32>,
     ) -> QueryResultFuture {
         unimplemented!();
     }
@@ -90,19 +92,18 @@ mod test {
 
         let store = Arc::new(MockStore::new(vec![(id, schema)]));
         store
-            .apply_entity_operations(
+            .apply_metadata_operations(
                 SubgraphDeploymentEntity::new(
                     &manifest,
                     false,
                     false,
-                    EthereumBlockPointer {
+                    None,
+                    Some(EthereumBlockPointer {
                         hash: H256::zero(),
                         number: 0,
-                    },
-                    0,
+                    }),
                 )
                 .create_operations(&manifest.id),
-                None,
             )
             .unwrap();
 

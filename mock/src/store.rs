@@ -11,15 +11,7 @@ use graph::prelude::*;
 use graph_graphql::prelude::api_schema;
 use web3::types::H256;
 
-/// A mock `ChainHeadUpdateListener`
-pub struct MockChainHeadUpdateListener {}
-
-impl ChainHeadUpdateListener for MockChainHeadUpdateListener {
-    fn subscribe(&self) -> ChainHeadUpdateStream {
-        unimplemented!();
-    }
-}
-
+#[derive(Debug)]
 pub struct MockStore {
     schemas: HashMap<SubgraphDeploymentId, Schema>,
 
@@ -59,6 +51,46 @@ impl MockStore {
             entities: Default::default(),
             subscriptions: Default::default(),
         }
+    }
+
+    pub fn user_subgraph_id() -> SubgraphDeploymentId {
+        SubgraphDeploymentId::new("UserSubgraph").unwrap()
+    }
+
+    /// Create a store that uses a very simple `User(id, name)` schema and
+    /// puts two users into the store
+    pub fn user_store() -> Self {
+        const USER_GQL: &str = "
+            type User @entity {
+                id: ID!,
+                name: String,
+            }
+            # Needed by ipfs_map in runtime/wasm/src/test.rs
+            type Thing @entity {
+                id: ID!,
+                value: String,
+                extra: String
+            }";
+        let subgraph = Self::user_subgraph_id();
+        let schema =
+            Schema::parse(USER_GQL, subgraph.clone()).expect("Failed to parse user schema");
+
+        // Build a map of entities
+        let mut alex = Entity::new();
+        alex.set("id", "alex");
+        alex.set("name", "Alex");
+        let mut steve = Entity::new();
+        steve.set("id", "steve");
+        steve.set("name", "Steve");
+        let mut users = HashMap::new();
+        users.insert("alex".to_owned(), alex);
+        users.insert("steve".to_owned(), steve);
+        let mut entities = HashMap::new();
+        entities.insert("User".to_owned(), users);
+
+        let store = Self::new(vec![(subgraph.clone(), schema)]);
+        store.entities.lock().unwrap().insert(subgraph, entities);
+        store
     }
 
     fn execute_query(
@@ -139,20 +171,15 @@ impl Store for MockStore {
         Ok(self.find(query)?.pop())
     }
 
-    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, QueryExecutionError> {
-        Ok(None)
+    fn find_ens_name(&self, hash: &str) -> Result<Option<String>, QueryExecutionError> {
+        let s1 = "dealdrafts".to_string();
+        match hash {
+            "0x7f0c1b04d1a4926f9c635a030eeb611d4c26e5e73291b32a1c7a4ac56935b5b3" => Ok(Some(s1)),
+            _ => Ok(None),
+        }
     }
 
-    fn block_ptr(&self, _: SubgraphDeploymentId) -> Result<EthereumBlockPointer, Error> {
-        unimplemented!();
-    }
-
-    fn set_block_ptr_with_no_changes(
-        &self,
-        _: SubgraphDeploymentId,
-        _: EthereumBlockPointer,
-        _: EthereumBlockPointer,
-    ) -> Result<bool, StoreError> {
+    fn block_ptr(&self, _: SubgraphDeploymentId) -> Result<Option<EthereumBlockPointer>, Error> {
         unimplemented!();
     }
 
@@ -160,24 +187,21 @@ impl Store for MockStore {
         &self,
         _: SubgraphDeploymentId,
         _: EthereumBlockPointer,
-        _: EthereumBlockPointer,
-        _: Vec<EntityOperation>,
+        _: Vec<EntityModification>,
+        _: StopwatchMetrics,
     ) -> Result<bool, StoreError> {
         unimplemented!();
     }
 
-    fn apply_entity_operations(
-        &self,
-        ops: Vec<EntityOperation>,
-        _: Option<HistoryEvent>,
-    ) -> Result<(), StoreError> {
+    fn apply_metadata_operations(&self, ops: Vec<MetadataOperation>) -> Result<(), StoreError> {
         let mut entities_ref = self.entities.lock().unwrap();
 
         let mut entities: HashMap<_, _> = entities_ref.clone();
         let mut entity_changes = vec![];
         for op in ops {
             match op {
-                EntityOperation::Set { key, data } => {
+                MetadataOperation::Set { entity, id, data } => {
+                    let key = MetadataOperation::entity_key(entity, id);
                     let entities_of_type = entities
                         .entry(key.subgraph_id.clone())
                         .or_default()
@@ -200,7 +224,8 @@ impl Store for MockStore {
                             .push(EntityChange::from_key(key, EntityChangeOperation::Set));
                     }
                 }
-                EntityOperation::Update { key, data, guard } => {
+                MetadataOperation::Update { entity, id, data } => {
+                    let key = MetadataOperation::entity_key(entity, id);
                     let entities_of_type = entities
                         .entry(key.subgraph_id.clone())
                         .or_default()
@@ -209,18 +234,6 @@ impl Store for MockStore {
 
                     if entities_of_type.contains_key(&key.entity_id) {
                         let existing_entity = entities_of_type.get_mut(&key.entity_id).unwrap();
-                        if let Some(filter) = guard {
-                            if !entity_matches_filter(existing_entity, &filter) {
-                                return Err(TransactionAbortError::AbortUnless {
-                                    expected_entity_ids: vec![key.entity_id],
-                                    actual_entity_ids: vec![],
-                                    description:
-                                        "update failed because entity does not match guard"
-                                            .to_owned(),
-                                }
-                                .into());
-                            }
-                        }
                         existing_entity.merge(data);
 
                         entity_changes
@@ -234,7 +247,8 @@ impl Store for MockStore {
                         .into());
                     }
                 }
-                EntityOperation::Remove { key } => {
+                MetadataOperation::Remove { entity, id } => {
+                    let key = MetadataOperation::entity_key(entity, id);
                     if let Some(in_subgraph) = entities.get_mut(&key.subgraph_id) {
                         if let Some(of_type) = in_subgraph.get_mut(&key.entity_type) {
                             if of_type.remove(&key.entity_id).is_some() {
@@ -246,7 +260,7 @@ impl Store for MockStore {
                         }
                     }
                 }
-                EntityOperation::AbortUnless {
+                MetadataOperation::AbortUnless {
                     description,
                     query,
                     entity_ids: mut expected_entity_ids,
@@ -304,6 +318,7 @@ impl Store for MockStore {
 
     fn build_entity_attribute_indexes(
         &self,
+        _: &SubgraphDeploymentId,
         _: Vec<AttributeIndexDefinition>,
     ) -> Result<(), SubgraphAssignmentProviderError> {
         Ok(())
@@ -331,19 +346,18 @@ impl Store for MockStore {
 
     fn create_subgraph_deployment(
         &self,
-        _logger: &Logger,
-        _subgraph_id: &SubgraphDeploymentId,
-        ops: Vec<EntityOperation>,
+        _schema: &Schema,
+        ops: Vec<MetadataOperation>,
     ) -> Result<(), StoreError> {
-        self.apply_entity_operations(ops, None)
+        self.apply_metadata_operations(ops)
     }
 
     fn start_subgraph_deployment(
         &self,
         _subgraph_id: &SubgraphDeploymentId,
-        ops: Vec<EntityOperation>,
+        ops: Vec<MetadataOperation>,
     ) -> Result<(), StoreError> {
-        self.apply_entity_operations(ops, None)
+        self.apply_metadata_operations(ops)
     }
 
     fn migrate_subgraph_deployment(
@@ -356,27 +370,27 @@ impl Store for MockStore {
 }
 
 impl SubgraphDeploymentStore for MockStore {
-    fn subgraph_schema(&self, subgraph_id: &SubgraphDeploymentId) -> Result<Arc<Schema>, Error> {
+    fn input_schema(&self, subgraph_id: &SubgraphDeploymentId) -> Result<Arc<Schema>, Error> {
         if *subgraph_id == *SUBGRAPHS_ID {
-            // The subgraph of subgraphs schema is built-in.
             let raw_schema = include_str!("../../store/postgres/src/subgraphs.graphql").to_owned();
-
-            // Parse the schema and add @subgraphId directives
-            let mut schema = Schema::parse(&raw_schema, subgraph_id.clone())?;
-
-            // Generate an API schema for the subgraph and make sure all types in the
-            // API schema have a @subgraphId directive as well
-            schema.document = api_schema(&schema.document)?;
-
+            let schema = Schema::parse(&raw_schema, subgraph_id.clone())?;
             return Ok(Arc::new(schema));
         }
         Ok(Arc::new(self.schemas.get(subgraph_id).unwrap().clone()))
     }
+
+    fn api_schema(&self, subgraph_id: &SubgraphDeploymentId) -> Result<Arc<Schema>, Error> {
+        let mut schema = self.input_schema(subgraph_id)?.as_ref().clone();
+        schema.document = api_schema(&schema.document)?;
+        return Ok(Arc::new(schema));
+    }
+
+    fn uses_relational_schema(&self, _: &SubgraphDeploymentId) -> Result<bool, Error> {
+        Ok(true)
+    }
 }
 
 impl ChainStore for MockStore {
-    type ChainHeadUpdateListener = MockChainHeadUpdateListener;
-
     fn genesis_block_ptr(&self) -> Result<EthereumBlockPointer, Error> {
         Ok(EthereumBlockPointer {
             hash: H256::zero(),
@@ -392,6 +406,10 @@ impl ChainStore for MockStore {
         unimplemented!();
     }
 
+    fn upsert_light_blocks(&self, _: Vec<LightEthereumBlock>) -> Result<(), Error> {
+        unimplemented!();
+    }
+
     fn attempt_chain_head_update(&self, _: u64) -> Result<Vec<H256>, Error> {
         unimplemented!();
     }
@@ -404,7 +422,7 @@ impl ChainStore for MockStore {
         Ok(None)
     }
 
-    fn block(&self, _: H256) -> Result<Option<EthereumBlock>, Error> {
+    fn blocks(&self, _: Vec<H256>) -> Result<Vec<LightEthereumBlock>, Error> {
         unimplemented!();
     }
 
@@ -417,11 +435,32 @@ impl ChainStore for MockStore {
     }
 }
 
+impl EthereumCallCache for MockStore {
+    fn get_call(
+        &self,
+        _: ethabi::Address,
+        _: &[u8],
+        _: EthereumBlockPointer,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        unimplemented!()
+    }
+
+    fn set_call(
+        &self,
+        _: ethabi::Address,
+        _: &[u8],
+        _: EthereumBlockPointer,
+        _: &[u8],
+    ) -> Result<(), Error> {
+        unimplemented!()
+    }
+}
+
 pub struct FakeStore;
 
 impl Store for FakeStore {
     fn get(&self, _: EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
-        unimplemented!();
+        Ok(None)
     }
 
     fn find(&self, _: EntityQuery) -> Result<Vec<Entity>, QueryExecutionError> {
@@ -440,16 +479,7 @@ impl Store for FakeStore {
         }
     }
 
-    fn block_ptr(&self, _: SubgraphDeploymentId) -> Result<EthereumBlockPointer, Error> {
-        unimplemented!();
-    }
-
-    fn set_block_ptr_with_no_changes(
-        &self,
-        _: SubgraphDeploymentId,
-        _: EthereumBlockPointer,
-        _: EthereumBlockPointer,
-    ) -> Result<bool, StoreError> {
+    fn block_ptr(&self, _: SubgraphDeploymentId) -> Result<Option<EthereumBlockPointer>, Error> {
         unimplemented!();
     }
 
@@ -457,22 +487,19 @@ impl Store for FakeStore {
         &self,
         _: SubgraphDeploymentId,
         _: EthereumBlockPointer,
-        _: EthereumBlockPointer,
-        _: Vec<EntityOperation>,
+        _: Vec<EntityModification>,
+        _: StopwatchMetrics,
     ) -> Result<bool, StoreError> {
         unimplemented!();
     }
 
-    fn apply_entity_operations(
-        &self,
-        _: Vec<EntityOperation>,
-        _: Option<HistoryEvent>,
-    ) -> Result<(), StoreError> {
+    fn apply_metadata_operations(&self, _: Vec<MetadataOperation>) -> Result<(), StoreError> {
         Ok(())
     }
 
     fn build_entity_attribute_indexes(
         &self,
+        _: &SubgraphDeploymentId,
         _: Vec<AttributeIndexDefinition>,
     ) -> Result<(), SubgraphAssignmentProviderError> {
         Ok(())
@@ -493,9 +520,8 @@ impl Store for FakeStore {
 
     fn create_subgraph_deployment(
         &self,
-        _logger: &Logger,
-        _subgraph_id: &SubgraphDeploymentId,
-        _ops: Vec<EntityOperation>,
+        _schema: &Schema,
+        _ops: Vec<MetadataOperation>,
     ) -> Result<(), StoreError> {
         unimplemented!()
     }
@@ -503,7 +529,7 @@ impl Store for FakeStore {
     fn start_subgraph_deployment(
         &self,
         _subgraph_id: &SubgraphDeploymentId,
-        _ops: Vec<EntityOperation>,
+        _ops: Vec<MetadataOperation>,
     ) -> Result<(), StoreError> {
         unimplemented!()
     }
@@ -519,8 +545,6 @@ impl Store for FakeStore {
 }
 
 impl ChainStore for FakeStore {
-    type ChainHeadUpdateListener = MockChainHeadUpdateListener;
-
     fn genesis_block_ptr(&self) -> Result<EthereumBlockPointer, Error> {
         unimplemented!();
     }
@@ -531,6 +555,10 @@ impl ChainStore for FakeStore {
         E: From<Error> + Send + 'a,
     {
         unimplemented!();
+    }
+
+    fn upsert_light_blocks(&self, _: Vec<LightEthereumBlock>) -> Result<(), Error> {
+        unimplemented!()
     }
 
     fn attempt_chain_head_update(&self, _: u64) -> Result<Vec<H256>, Error> {
@@ -545,7 +573,7 @@ impl ChainStore for FakeStore {
         unimplemented!();
     }
 
-    fn block(&self, _: H256) -> Result<Option<EthereumBlock>, Error> {
+    fn blocks(&self, _: Vec<H256>) -> Result<Vec<LightEthereumBlock>, Error> {
         unimplemented!();
     }
 

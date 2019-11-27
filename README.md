@@ -1,7 +1,5 @@
 # Graph Node
 
-**Note:** This project is a heavily WIP and until it reaches v1.0, the API is subject to change in breaking ways without notice.
-
 [![Build Status](https://travis-ci.org/graphprotocol/graph-node.svg?branch=master)](https://travis-ci.org/graphprotocol/graph-node)
 [![Getting Started Docs](https://img.shields.io/badge/docs-getting--started-brightgreen.svg)](docs/getting-started.md)
 
@@ -61,13 +59,13 @@ This will also spin up a GraphiQL interface at `http://127.0.0.1:8000/`.
 6.  With this ENS example, to get the subgraph working locally run:
 
 ```
-yarn create-subgraph
+yarn create-local
 ```
 
 Then you can deploy the subgraph:
 
 ```
-yarn deploy --debug
+yarn deploy-local
 ```
 
 This will build and deploy the subgraph to the Graph Node. It should start indexing the subgraph immediately.
@@ -114,11 +112,8 @@ OPTIONS:
 
 ### Environment Variables
 
-The Graph supports the following environment variables:
-
-```
-THEGRAPH_SENTRY_URL (optional) — Activates error reporting using Sentry
-```
+See [here](https://github.com/graphprotocol/graph-node/blob/master/docs/environment-variables.md) for a list of
+the environment variables that can be configured.
 
 ## Project Layout
 
@@ -127,7 +122,7 @@ THEGRAPH_SENTRY_URL (optional) — Activates error reporting using Sentry
   common data.
 - `core` — A library providing implementations for core components, used by all
   nodes.
-- `datasource/ethereum` — A library with components for obtaining data from
+- `chain/ethereum` — A library with components for obtaining data from
   Ethereum.
 - `graphql` — A GraphQL implementation with API schema generation,
   introspection, and more.

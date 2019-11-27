@@ -24,36 +24,64 @@ use diesel::debug_query;
 use diesel::deserialize::QueryableByName;
 use diesel::dsl::{any, sql};
 use diesel::pg::{Pg, PgConnection};
+use diesel::r2d2::{ConnectionManager, PooledConnection};
 use diesel::sql_types::{Integer, Jsonb, Nullable, Text};
 use diesel::BoolExpressionMethods;
 use diesel::Connection as _;
 use diesel::ExpressionMethods;
 use diesel::{OptionalExtension, QueryDsl, RunQueryDsl};
-use diesel_dynamic_schema::{Column, Table as DynamicTable};
 use inflector::cases::snakecase::to_snake_case;
-use std::cell::RefCell;
+use lazy_static::lazy_static;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use graph::data::schema::Schema as SubgraphSchema;
 use graph::data::subgraph::schema::SUBGRAPHS_ID;
-use graph::prelude::serde_json;
 use graph::prelude::{
-    debug, format_err, info, warn, AttributeIndexDefinition, EntityChange, EntityChangeOperation,
-    EntityFilter, EntityKey, Error, EthereumBlockPointer, EventSource, HistoryEvent, Logger,
-    QueryExecutionError, StoreError, StoreEvent, SubgraphDeploymentId, TransactionAbortError,
-    ValueType,
+    debug, format_err, info, serde_json, warn, AttributeIndexDefinition, Entity, EntityChange,
+    EntityChangeOperation, EntityFilter, EntityKey, EntityModification, Error,
+    EthereumBlockPointer, Logger, QueryExecutionError, StoreError, StoreEvent,
+    SubgraphDeploymentId, SubgraphDeploymentStore, ValueType,
 };
 
-use crate::filter::{build_filter, store_filter};
-use crate::functions::set_config;
+use crate::block_range::{block_number, BlockNumber};
+use crate::filter::build_filter;
+use crate::history_event::HistoryEvent;
 use crate::jsonb::PgJsonbExpressionMethods as _;
+use crate::notification_listener::JsonNotification;
+use crate::relational::{IdType, Layout};
+use crate::store::Store;
 
-/// The size of string prefixes that we index. This should be large enough
-/// that we catch most strings, but small enough so that we can still insert
-/// it into a Postgres BTree index
-pub(crate) const STRING_PREFIX_SIZE: usize = 2048;
+lazy_static! {
+    // We allow overriding the default storage scheme with the environment
+    // variable `GRAPH_STORAGE_SCHEME` in an overabundance of caution in case
+    // there is a problem with the default, relational storage. Eventually,
+    // this choice will go away.
+    static ref GRAPH_STORAGE_SCHEME: self::public::DeploymentSchemaVersion = {
+        use self::public::DeploymentSchemaVersion as v;
+
+        match std::env::var("GRAPH_STORAGE_SCHEME")
+                .unwrap_or_else(|_| "relational".to_owned())
+                .as_str() {
+            "relational" => v::Relational,
+            "json" => v::Split,
+            _ => panic!("Invalid value for GRAPH_STORAGE_SCHEME. It must be \
+                 either `relational` or `json`")
+        }
+    };
+}
+
+/// The size of string prefixes that we index. This is chosen so that we
+/// will index strings that people will do string comparisons like
+/// `=` or `!=` on; if text longer than this is stored in a String attribute
+/// it is highly unlikely that they will be used for exact string operations.
+/// This also makes sure that we do not put strings into a BTree index that's
+/// bigger than Postgres' limit on such strings which is about 2k
+pub const STRING_PREFIX_SIZE: usize = 256;
 
 /// The type of operation that led to a history entry. When we revert a block,
 /// we reverse the effects of that operation; e.g., an `Insert` entry in the
@@ -97,20 +125,19 @@ mod public {
     /// `deployment_schema_version` type in the database.
     ///
     /// The column `deployment_schemas.version` stores that information for
-    /// each subgraph. Subgraphs that use the `Public` scheme have their
-    /// entities stored in the monolithic `public.entities` table, subgraphs
-    /// that store their entities and history in a dedicated database schema
-    /// are marked with version `Split`. The `Public` variant is not supported
-    /// any longer, and trying to access subgraphs using that schema will fail.
+    /// each subgraph. Subgraphs that store their entities and history as
+    /// JSONB blobs with a separate history table are marked with version
+    /// `Split`. Subgraphs that use a relational schema for entities, and
+    /// store their history in the same table are marked as 'Relational'
     ///
     /// Migrating a subgraph amounts to changing the storage scheme for that
     /// subgraph from one version to another. Whether a subgraph scheme needs
     /// migrating is determined by `Table::needs_migrating`, the migration
     /// machinery is kicked off with a call to `Connection::migrate`
-    #[derive(DbEnum, Debug, Clone)]
+    #[derive(DbEnum, Debug, Clone, Copy)]
     pub enum DeploymentSchemaVersion {
-        Public,
         Split,
+        Relational,
     }
 
     /// Migrating a subgraph is broken into two steps: in the first step, the
@@ -200,8 +227,12 @@ mod subgraphs {
 
 impl EntitySource for self::subgraphs::entities::table {}
 
+pub(crate) type EntityTable = diesel_dynamic_schema::Table<String>;
+
+pub(crate) type EntityColumn<ST> = diesel_dynamic_schema::Column<EntityTable, String, ST>;
+
 // This is a bit weak, as any DynamicTable<String> is now an EntitySource
-impl EntitySource for DynamicTable<String> {}
+impl EntitySource for EntityTable {}
 
 use public::deployment_schemas;
 
@@ -245,21 +276,35 @@ struct Schema {
     state: public::DeploymentSchemaState,
 }
 
-type EntityColumn<ST> = Column<DynamicTable<String>, String, ST>;
-
-/// A table representing a split entities table, i.e. a setup where
-/// a subgraph deployment's entities are stored in their own schema
+/// Storage using JSONB for entities. All entities are stored in one table
 #[derive(Debug, Clone)]
-pub(crate) struct Table {
+pub(crate) struct JsonStorage {
     /// The name of the database schema
     schema: String,
     /// The subgraph id
     subgraph: SubgraphDeploymentId,
-    table: DynamicTable<String>,
+    table: EntityTable,
     id: EntityColumn<diesel::sql_types::Text>,
     entity: EntityColumn<diesel::sql_types::Text>,
     data: EntityColumn<diesel::sql_types::Jsonb>,
     event_source: EntityColumn<diesel::sql_types::Text>,
+    // The query to count all entities
+    count_query: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum Storage {
+    Json(JsonStorage),
+    Relational(Layout),
+}
+
+impl Storage {
+    fn subgraph(&self) -> &SubgraphDeploymentId {
+        match self {
+            Storage::Json(json) => &json.subgraph,
+            Storage::Relational(layout) => &layout.subgraph,
+        }
+    }
 }
 
 /// Helper struct to support a custom query for entity history
@@ -288,39 +333,60 @@ impl QueryableByName<Pg> for RawHistory {
     }
 }
 
-/// A connection into the database to handle entities which caches the
-/// mapping to actual database tables. Instances of this struct must not be
-/// cached across transactions as there is no mechanism in place to notify
-/// other index nodes that a subgraph has been migrated
-pub(crate) struct Connection<'a> {
-    pub conn: &'a PgConnection,
-    tables: RefCell<HashMap<SubgraphDeploymentId, Table>>,
+/// A cache for storage objects as constructing them takes a bit of
+/// computation. The cache lives as an attribute on the Store, but is managed
+/// solely from this module
+pub(crate) type StorageCache = Mutex<HashMap<SubgraphDeploymentId, Arc<Storage>>>;
+
+pub(crate) fn make_storage_cache() -> StorageCache {
+    Mutex::new(HashMap::new())
 }
 
-impl<'a> Connection<'a> {
-    pub(crate) fn new(conn: &'a PgConnection) -> Connection<'a> {
-        Connection {
-            conn,
-            tables: RefCell::new(HashMap::new()),
-        }
-    }
+/// A connection into the database to handle entities. The connection is
+/// specific to one subgraph, and can only handle entities from that subgraph
+/// or from the metadata subgraph. Attempts to access other subgraphs will
+/// generally result in a panic.
+///
+/// Instances of this struct must not be cached across transactions as there
+/// is no mechanism in place to notify other index nodes that a subgraph has
+/// been migrated
+#[derive(Constructor)]
+pub(crate) struct Connection {
+    conn: PooledConnection<ConnectionManager<PgConnection>>,
+    /// The storage of the subgraph we are dealing with; entities
+    /// go into this
+    storage: Arc<Storage>,
+    /// The layout of the subgraph of subgraphs where we keep subgraph
+    /// metadata
+    metadata: Arc<Storage>,
+}
 
-    /// Return a table for the subgraph
-    fn table(&self, subgraph: &SubgraphDeploymentId) -> Result<Table, StoreError> {
-        let mut tables = self.tables.borrow_mut();
-
-        match tables.get(subgraph) {
-            Some(table) => Ok(table.clone()),
-            None => {
-                let table = Table::new(self.conn, subgraph)?;
-                tables.insert(subgraph.clone(), table.clone());
-                Ok(table)
-            }
+impl Connection {
+    /// Return the storage for `key`, which must refer either to the subgraph
+    /// for this connection, or the metadata subgraph.
+    ///
+    /// # Panics
+    ///
+    /// If `key` does not reference the connection's subgraph or the metadata
+    /// subgraph
+    fn storage_for(&self, key: &EntityKey) -> &Storage {
+        if key.subgraph_id == *SUBGRAPHS_ID {
+            self.metadata.as_ref()
+        } else if &key.subgraph_id == self.storage.subgraph() {
+            self.storage.as_ref()
+        } else {
+            panic!(
+                "A connection can only be used with one subgraph and \
+                 the metadata subgraph.\nThe connection for {} is also \
+                 used with {}",
+                self.storage.subgraph(),
+                key.subgraph_id
+            );
         }
     }
 
     /// Do any cleanup to bring the subgraph into a known good state
-    pub(crate) fn start_subgraph(&self, subgraph: &SubgraphDeploymentId) -> Result<(), StoreError> {
+    pub(crate) fn start_subgraph(&self) -> Result<(), StoreError> {
         use public::deployment_schemas as dsl;
 
         // Clear the `migrating` lock on the subgraph; this flag must be
@@ -330,66 +396,115 @@ impl<'a> Connection<'a> {
         // down, `migrating` remains set to `true` even though no work for
         // the migration is being done.
         Ok(
-            diesel::update(dsl::table.filter(dsl::subgraph.eq(subgraph.to_string())))
-                .set(dsl::migrating.eq(false))
-                .execute(self.conn)
-                .map(|_| ())?,
+            diesel::update(
+                dsl::table.filter(dsl::subgraph.eq(self.storage.subgraph().to_string())),
+            )
+            .set(dsl::migrating.eq(false))
+            .execute(&self.conn)
+            .map(|_| ())?,
         )
     }
 
     pub(crate) fn find(
         &self,
-        subgraph: &SubgraphDeploymentId,
         entity: &String,
         id: &String,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
-        let table = self.table(subgraph)?;
-        table.find(self.conn, entity, id)
+        block: BlockNumber,
+    ) -> Result<Option<Entity>, StoreError> {
+        match &*self.storage {
+            Storage::Json(json) => json.find(&self.conn, entity, id),
+            Storage::Relational(layout) => layout.find(&self.conn, entity, id, block),
+        }
     }
 
     pub(crate) fn query(
         &self,
-        subgraph: &SubgraphDeploymentId,
         entity_types: Vec<String>,
         filter: Option<EntityFilter>,
-        order: Option<(String, ValueType, &str, &str)>,
+        order: Option<(String, ValueType, &str)>,
         first: Option<u32>,
         skip: u32,
-    ) -> Result<Vec<(serde_json::Value, String)>, QueryExecutionError> {
-        let table = self.table(subgraph)?;
-        table.query(self.conn, entity_types, filter, order, first, skip)
+        block: BlockNumber,
+    ) -> Result<Vec<Entity>, QueryExecutionError> {
+        match &*self.storage {
+            Storage::Json(json) => json.query(&self.conn, entity_types, filter, order, first, skip),
+            Storage::Relational(layout) => {
+                layout.query(&self.conn, entity_types, filter, order, first, skip, block)
+            }
+        }
     }
 
     pub(crate) fn conflicting_entity(
         &self,
-        subgraph: &SubgraphDeploymentId,
         entity_id: &String,
         entities: Vec<&String>,
     ) -> Result<Option<String>, StoreError> {
-        let table = self.table(subgraph)?;
-        table.conflicting_entity(self.conn, entity_id, entities)
+        match &*self.storage {
+            Storage::Json(json) => json.conflicting_entity(&self.conn, entity_id, entities),
+            Storage::Relational(layout) => {
+                layout.conflicting_entity(&self.conn, entity_id, entities)
+            }
+        }
     }
 
     pub(crate) fn insert(
         &self,
         key: &EntityKey,
-        data: &serde_json::Value,
+        entity: &Entity,
         history_event: Option<&HistoryEvent>,
-    ) -> Result<usize, StoreError> {
-        let table = self.table(&key.subgraph_id)?;
-        table.insert(self.conn, key, data, history_event)
+    ) -> Result<(), StoreError> {
+        match self.storage_for(key) {
+            Storage::Json(json) => json
+                .insert(&self.conn, &key, entity, history_event)
+                .map(|_| ()),
+            Storage::Relational(layout) => {
+                layout.insert(&self.conn, key, entity, block_number(&history_event))
+            }
+        }
     }
 
     pub(crate) fn update(
         &self,
         key: &EntityKey,
-        data: &serde_json::Value,
-        overwrite: bool,
-        guard: Option<EntityFilter>,
+        entity: &Entity,
         history_event: Option<&HistoryEvent>,
+    ) -> Result<(), StoreError> {
+        match self.storage_for(key) {
+            Storage::Json(json) => json
+                .update(&self.conn, key, entity, history_event)
+                .map(|_| ()),
+            Storage::Relational(layout) => {
+                layout.update(&self.conn, key, entity, block_number(&history_event))
+            }
+        }
+    }
+
+    /// Update a metadata entity. The `entity` should only contain the fields
+    /// that should be changed.
+    pub(crate) fn update_metadata(
+        &self,
+        key: &EntityKey,
+        entity: &Entity,
     ) -> Result<usize, StoreError> {
-        let table = self.table(&key.subgraph_id)?;
-        table.update(self.conn, key, data, overwrite, guard, history_event)
+        match &*self.metadata {
+            Storage::Json(json) => json.update_metadata(&self.conn, key, entity),
+            Storage::Relational(_) => unreachable!("relational storeage is not used for metadata"),
+        }
+    }
+
+    pub(crate) fn find_metadata(
+        &self,
+        entity: &String,
+        id: &String,
+    ) -> Result<Option<Entity>, StoreError> {
+        use self::subgraphs::entities;
+        entities::dsl::entities
+            .filter(entities::entity.eq(entity).and(entities::id.eq(id)))
+            .select(entities::data)
+            .first::<serde_json::Value>(&self.conn)
+            .optional()?
+            .map(|json| entity_from_json(json, entity))
+            .transpose()
     }
 
     pub(crate) fn delete(
@@ -397,59 +512,93 @@ impl<'a> Connection<'a> {
         key: &EntityKey,
         history_event: Option<&HistoryEvent>,
     ) -> Result<usize, StoreError> {
-        let table = self.table(&key.subgraph_id)?;
-        table.delete(self.conn, key, history_event)
+        match self.storage_for(key) {
+            Storage::Json(json) => json.delete(&self.conn, key, history_event),
+            Storage::Relational(layout) => {
+                layout.delete(&self.conn, key, block_number(&history_event))
+            }
+        }
     }
 
     pub(crate) fn build_attribute_index(
         &self,
         index: &AttributeIndexDefinition,
     ) -> Result<usize, StoreError> {
-        let table = self.table(&index.subgraph_id)?;
-        table.build_attribute_index(self.conn, index)
+        match &*self.storage {
+            Storage::Json(json) => json.build_attribute_index(&self.conn, index),
+            Storage::Relational(_) => Ok(1),
+        }
     }
 
     pub(crate) fn revert_block(
         &self,
-        subgraph: &SubgraphDeploymentId,
-        block_ptr: String,
+        block_ptr: &EthereumBlockPointer,
     ) -> Result<(StoreEvent, i32), StoreError> {
-        // Revert the block in the subgraph itself
-        let table = self.table(subgraph)?;
-        let (event, count) = table.revert_block(self.conn, block_ptr.clone())?;
+        // The subgraph in which we are reverting
+        let subgraph = self.storage.subgraph();
 
+        // Revert the block in the subgraph itself
+        let (event, count) = match &*self.storage {
+            Storage::Json(json) => json.revert_block(&self.conn, block_ptr.hash_hex())?,
+            Storage::Relational(layout) => {
+                let block = block_ptr.number.try_into().unwrap();
+                layout.revert_block(&self.conn, block)?
+            }
+        };
         // Revert the meta data changes that correspond to this subgraph.
         // Only certain meta data changes need to be reverted, most
         // importantly creation of dynamic data sources. We ensure in the
         // rest of the code that we only record history for those meta data
         // changes that might need to be reverted
-        let table = self.table(&SUBGRAPHS_ID)?;
-        let (meta_event, _) = table.revert_block_meta(self.conn, subgraph, block_ptr)?;
-        Ok((event.extend(meta_event), count))
+        match &*self.metadata {
+            Storage::Json(json) => {
+                let (meta_event, _) =
+                    json.revert_block_meta(&self.conn, subgraph, block_ptr.hash_hex())?;
+                Ok((event.extend(meta_event), count))
+            }
+            Storage::Relational(_) => unreachable!(
+                "Storing the subgraph of subgraphs in a relational schema is not supported"
+            ),
+        }
     }
 
-    pub(crate) fn update_entity_count(
-        &self,
-        subgraph: &Option<SubgraphDeploymentId>,
-        count: i32,
-    ) -> Result<(), StoreError> {
+    pub(crate) fn update_entity_count(&self, count: i32) -> Result<(), StoreError> {
         if count == 0 {
             return Ok(());
         }
-        if let Some(subgraph) = subgraph {
-            let table = self.table(&subgraph)?;
-            table.update_entity_count(self.conn, subgraph, count)
-        } else {
-            Ok(())
-        }
+
+        self.storage.update_entity_count(&self.conn, count)
     }
 
     pub(crate) fn create_history_event(
         &self,
-        subgraph: SubgraphDeploymentId,
-        event_source: EventSource,
+        block_ptr: EthereumBlockPointer,
+        mods: &Vec<EntityModification>,
     ) -> Result<HistoryEvent, Error> {
-        create_history_event(self.conn, subgraph, event_source)
+        let has_removes = mods.iter().any(|m| m.is_remove());
+        match &*self.storage {
+            Storage::Json(json) => {
+                HistoryEvent::allocate(&self.conn, json.subgraph.clone(), block_ptr, has_removes)
+            }
+            Storage::Relational(layout) => {
+                // For relational storage, we do not need an entry in event_meta_data
+                // _unless_ any change we will make touches the metadata subgraph
+                // since that uses JSON storage
+                if mods.iter().any(|m| m.is_meta()) {
+                    HistoryEvent::allocate(
+                        &self.conn,
+                        layout.subgraph.clone(),
+                        block_ptr,
+                        has_removes,
+                    )
+                } else {
+                    Ok(HistoryEvent::create_without_event_metadata(
+                        layout.subgraph.clone(),
+                        block_ptr,
+                    ))
+                }
+            }
+        }
     }
 
     /// Check if the schema for `subgraph` needs to be migrated, and if so
@@ -468,9 +617,7 @@ impl<'a> Connection<'a> {
         // 5 minutes
         const MIGRATION_CHECK_FREQ: u64 = 20;
 
-        let table = self.table(subgraph)?;
-
-        if table.needs_migrating() {
+        if self.storage.needs_migrating() {
             // We determine whether it is time for us to check if we should
             // migrate in a way that tries to splay the checks for different
             // subgraphs, using the hash of the subgraph id as a somewhat
@@ -500,11 +647,11 @@ impl<'a> Connection<'a> {
     pub(crate) fn migrate(
         self,
         logger: &Logger,
-        subgraph: &SubgraphDeploymentId,
         block_ptr: &EthereumBlockPointer,
     ) -> Result<bool, Error> {
         // How many simultaneous subgraph migrations we allow
         const MIGRATION_LIMIT: i32 = 2;
+        let subgraph = self.storage.subgraph();
 
         if !self.should_migrate(subgraph, block_ptr)? {
             return Ok(false);
@@ -513,7 +660,7 @@ impl<'a> Connection<'a> {
         let do_migrate = self.conn.transaction(|| -> Result<bool, Error> {
             let lock =
                 diesel::sql_query("lock table public.deployment_schemas in exclusive mode nowait")
-                    .execute(self.conn);
+                    .execute(&self.conn);
             if lock.is_err() {
                 return Ok(false);
             }
@@ -526,7 +673,7 @@ impl<'a> Connection<'a> {
             let query = diesel::sql_query(query)
                 .bind::<Text, _>(subgraph.to_string())
                 .bind::<Integer, _>(MIGRATION_LIMIT);
-            Ok(query.execute(self.conn)? > 0)
+            Ok(query.execute(&self.conn)? > 0)
         })?;
 
         if do_migrate {
@@ -551,7 +698,7 @@ impl<'a> Connection<'a> {
             // the migration
             diesel::update(dsl::table.filter(dsl::subgraph.eq(subgraph.to_string())))
                 .set(dsl::migrating.eq(false))
-                .execute(self.conn)?;
+                .execute(&self.conn)?;
             result
         } else {
             Ok(false)
@@ -561,18 +708,22 @@ impl<'a> Connection<'a> {
     /// Perform one migration step and return true if there are more steps
     /// left to do. Each step of the migration is performed in  a separate
     /// transaction so that any locks a step takes are freed up at the end
+    // We do not currently use this, but getting the framework right was
+    // painful enough that we should preserve the general setup of
+    // per-subgraph migrations
+    #[allow(unreachable_code, unused_variables)]
     fn migration_step(
         &self,
         logger: &Logger,
         subgraph: &SubgraphDeploymentId,
     ) -> Result<bool, Error> {
+        unreachable!("The curent code base does not require any subgraph migrations");
         self.conn.transaction(|| -> Result<bool, Error> {
-            let table = self.table(subgraph)?;
             let errmsg = format_err!(
                 "subgraph {} has no entry in deployment_schemas and can not be migrated",
                 subgraph.to_string()
             );
-            let schema = find_schema(self.conn, &subgraph)?.ok_or(errmsg)?;
+            let schema = find_schema(&self.conn, &subgraph)?.ok_or(errmsg)?;
 
             debug!(
                 logger,
@@ -582,9 +733,13 @@ impl<'a> Connection<'a> {
                 "state" => format!("{:?}", schema.state)
             );
             let start = Instant::now();
-            let table = table.migrate(self.conn, logger, &schema)?;
-            let needs_migrating = table.needs_migrating();
-            self.tables.borrow_mut().insert(subgraph.clone(), table);
+            // Do the actual migration, and return an updated storage
+            // object, something like
+            //
+            // let storage = storage.migrate(&self.conn, logger, &schema)?;
+            // let needs_migrating = storage.needs_migrating();
+            // self.cache.borrow_mut().insert(subgraph.clone(), Arc::new(storage));
+            //
             info!(
                 logger,
                 "finished migrating";
@@ -593,8 +748,79 @@ impl<'a> Connection<'a> {
                 "state" => format!("{:?}", schema.state),
                 "migration_time_ms" => start.elapsed().as_millis()
             );
-            Ok(needs_migrating)
+            Ok(self.storage.needs_migrating())
         })
+    }
+
+    pub(crate) fn send_store_event(&self, event: &StoreEvent) -> Result<(), StoreError> {
+        let v = serde_json::to_value(event)?;
+        JsonNotification::send("store_events", &v, &*self.conn)
+    }
+
+    pub(crate) fn transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+        E: From<diesel::result::Error>,
+    {
+        self.conn.transaction(f)
+    }
+
+    /// Create the database schema for a new subgraph, including all tables etc.
+    ///
+    /// It is an error if `deployment_schemas` already has an entry for this
+    /// `subgraph_id`. Note that `self` must be a connection for the subgraph
+    /// of subgraphs
+    pub(crate) fn create_schema(&self, schema: &SubgraphSchema) -> Result<(), StoreError> {
+        use self::public::DeploymentSchemaVersion as v;
+
+        assert_eq!(
+            &*SUBGRAPHS_ID,
+            self.storage.subgraph(),
+            "create_schema can only be called on a Connection for the metadata subgraph"
+        );
+
+        // Check if there already is an entry for this subgraph. If so, do
+        // nothing
+        let count = deployment_schemas::table
+            .filter(deployment_schemas::subgraph.eq(schema.id.to_string()))
+            .count()
+            .first::<i64>(&self.conn)?;
+        if count > 0 {
+            return Ok(());
+        }
+
+        // Create a schema for the deployment.
+        let schemas: Vec<String> = diesel::insert_into(deployment_schemas::table)
+            .values((
+                deployment_schemas::subgraph.eq(schema.id.to_string()),
+                deployment_schemas::version.eq(*GRAPH_STORAGE_SCHEME),
+            ))
+            .returning(deployment_schemas::name)
+            .get_results(&self.conn)?;
+        let schema_name = schemas
+            .first()
+            .ok_or_else(|| format_err!("failed to read schema name for {} back", &schema.id))?;
+
+        let query = format!("create schema {}", schema_name);
+        self.conn.batch_execute(&*query)?;
+
+        match *GRAPH_STORAGE_SCHEME {
+            v::Relational => Layout::create_relational_schema(
+                &self.conn,
+                &schema_name,
+                schema.id.clone(),
+                &schema.document,
+            )
+            .map(|_| ()),
+            v::Split => create_split_schema(&self.conn, &schema_name),
+        }
+    }
+
+    pub(crate) fn uses_relational_schema(&self) -> bool {
+        match &*self.storage {
+            Storage::Json(_) => false,
+            Storage::Relational(_) => true,
+        }
     }
 }
 
@@ -610,194 +836,93 @@ fn find_schema(
         .optional()?)
 }
 
-impl Table {
-    // Update for a split entities table, called from Table.update. It's lengthy,
-    // so we split it into its own helper function
-    fn update_data(
-        &self,
-        conn: &PgConnection,
-        key: &EntityKey,
-        data: &serde_json::Value,
-        overwrite: bool,
-        guard: Option<EntityFilter>,
-        history_event: Option<&HistoryEvent>,
-    ) -> Result<usize, StoreError> {
-        if !guard.is_none() && key.subgraph_id != *SUBGRAPHS_ID {
-            // We can only make adding additional conditions to the update
-            // operation work for a query that is fully generated with
-            // Diesel's DSL. Trying to combine the result of build_filter
-            // with a direct query is too cumbersome because of various type
-            // system gyrations. For now, we also only need update guards for
-            // the subgraph of subgraphs
-            panic!("update guards are only possible for the 'subgraphs' subgraph");
-        }
-
-        let event_source = HistoryEvent::to_event_source_string(&history_event);
-
-        if let Some(filter) = guard {
-            // Update for subgraph of subgraphs with a guard
-            use self::subgraphs::entities;
-
-            let filter = build_filter(filter).map_err(|e| {
-                TransactionAbortError::Other(format!(
-                    "invalid filter '{}' for value '{}'",
-                    e.filter, e.value
-                ))
-            })?;
-
-            let target = entities::table
-                .filter(entities::entity.eq(&key.entity_type))
-                .filter(entities::id.eq(&key.entity_id));
-
-            if overwrite {
-                Ok(diesel::update(target)
-                    .set((
-                        entities::data.eq(&data),
-                        entities::event_source.eq(&event_source),
-                    ))
-                    .filter(filter)
-                    .execute(conn)?)
-            } else {
-                Ok(diesel::update(target)
-                    .set((
-                        entities::data.eq(entities::data.merge(&data)),
-                        entities::event_source.eq(&event_source),
-                    ))
-                    .filter(filter)
-                    .execute(conn)?)
-            }
-        } else {
-            // If there is no guard (which has to include all 'normal' subgraphs),
-            // we need to use a direct query since diesel::update does not like
-            // dynamic tables.
-            let query = if overwrite {
-                format!(
-                    "update {}.entities
-                       set data = $3, event_source = $4
-                       where entity = $1 and id = $2",
-                    self.schema
-                )
-            } else {
-                format!(
-                    "update {}.entities
-                       set data = data || $3, event_source = $4
-                       where entity = $1 and id = $2",
-                    self.schema
-                )
-            };
-            let query = diesel::sql_query(query)
-                .bind::<Text, _>(&key.entity_type)
-                .bind::<Text, _>(&key.entity_id)
-                .bind::<Jsonb, _>(data)
-                .bind::<Text, _>(&event_source);
-            query.execute(conn).map_err(|e| {
-                format_err!(
-                    "Failed to update entity ({}, {}, {}): {}",
-                    key.subgraph_id,
-                    key.entity_type,
-                    key.entity_id,
-                    e
-                )
-                .into()
-            })
-        }
-    }
+fn entity_to_json(key: &EntityKey, entity: &Entity) -> Result<serde_json::Value, Error> {
+    serde_json::to_value(entity).map_err(|e| {
+        format_err!(
+            "Failed to convert entity ({}, {}, {}) to JSON: {}",
+            key.subgraph_id,
+            key.entity_type,
+            key.entity_id,
+            e
+        )
+    })
 }
 
-impl Table {
-    /// The version for newly created subgraph schemas. Changing this most
-    /// likely also requires changing `create_schema`
-    const DEFAULT_VERSION: public::DeploymentSchemaVersion = public::DeploymentSchemaVersion::Split;
+fn entity_from_json(json: serde_json::Value, entity: &str) -> Result<Entity, StoreError> {
+    let mut value = serde_json::from_value::<Entity>(json)?;
+    value.set("__typename", entity);
+    Ok(value)
+}
 
-    /// Look up the schema for `subgraph` and return its entity table.
-    /// Returns an error if `subgraph` does not have an entry in
-    /// `deployment_schemas`, which can only happen if `create_schema` was not
-    /// called for that `subgraph`
-    fn new(conn: &PgConnection, subgraph: &SubgraphDeploymentId) -> Result<Self, StoreError> {
-        use public::DeploymentSchemaVersion as V;
-
-        let schema = find_schema(conn, subgraph)?
-            .ok_or_else(|| StoreError::Unknown(format_err!("unknown subgraph {}", subgraph)))?;
-        let table = match schema.version {
-            V::Public => {
-                return Err(StoreError::Unknown(format_err!(
-                    "subgraph {}: storage scheme {:?} is no longer supported",
-                    subgraph,
-                    schema.version
-                )))
-            }
-            V::Split => {
-                let table =
-                    diesel_dynamic_schema::schema(schema.name.clone()).table("entities".to_owned());
-                let id = table.column::<Text, _>("id".to_string());
-                let entity = table.column::<Text, _>("entity".to_string());
-                let data = table.column::<Jsonb, _>("data".to_string());
-                let event_source = table.column::<Text, _>("event_source".to_string());
-
-                Table {
-                    schema: schema.name,
-                    subgraph: subgraph.clone(),
-                    table,
-                    id,
-                    entity,
-                    data,
-                    event_source,
-                }
-            }
-        };
-        Ok(table)
-    }
-
-    /// Return an entity key for the entity of the given type and id in the
-    /// subgraph stored in `self`
-    fn entity_key(&self, entity_type: String, entity_id: String) -> EntityKey {
-        let subgraph_id = self.subgraph.clone();
-        EntityKey {
-            subgraph_id,
-            entity_type,
-            entity_id,
-        }
-    }
-
+impl JsonStorage {
     fn find(
         &self,
         conn: &PgConnection,
         entity: &str,
         id: &String,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
+    ) -> Result<Option<Entity>, StoreError> {
         let entities = self.clone();
-        Ok(entities
+        entities
             .table
             .filter(entities.entity.eq(entity).and(entities.id.eq(id)))
             .select(entities.data)
             .first::<serde_json::Value>(conn)
-            .optional()?)
+            .optional()?
+            .map(|json| entity_from_json(json, entity))
+            .transpose()
     }
 
-    /// order is a tuple (attribute, value_type, cast, direction)
+    /// order is a tuple (attribute, value_type, direction)
     fn query(
         &self,
         conn: &PgConnection,
         entity_types: Vec<String>,
         filter: Option<EntityFilter>,
-        order: Option<(String, ValueType, &str, &str)>,
+        order: Option<(String, ValueType, &str)>,
         first: Option<u32>,
         skip: u32,
-    ) -> Result<Vec<(serde_json::Value, String)>, QueryExecutionError> {
+    ) -> Result<Vec<Entity>, QueryExecutionError> {
         let entities = self.clone();
-        let mut query = entities
-            .table
-            .filter((&self.entity).eq(any(entity_types)))
-            .select((&self.data, &self.entity))
-            .into_boxed::<Pg>();
+        let mut query = if entity_types.len() == 1 {
+            // If there is only one entity_type, which is the case in all
+            // queries that do not involve interfaces, leaving out `any`
+            // lets Postgres use the primary key index on the entities table
+            let entity_type = entity_types.first().unwrap();
+            entities
+                .table
+                .select((&self.data, &self.entity))
+                .filter((&self.entity).eq(entity_type))
+                .into_boxed::<Pg>()
+        } else {
+            entities
+                .table
+                .select((&self.data, &self.entity))
+                .filter((&self.entity).eq(any(entity_types)))
+                .into_boxed::<Pg>()
+        };
 
         if let Some(filter) = filter {
-            query = store_filter(query, filter).map_err(|e| {
+            let filter = build_filter(filter).map_err(|e| {
                 QueryExecutionError::FilterNotSupportedError(format!("{}", e.value), e.filter)
             })?;
+            query = query.filter(filter);
         }
 
-        if let Some((attribute, value_type, cast, direction)) = order {
+        if let Some((attribute, value_type, direction)) = order {
+            let cast = match value_type {
+                ValueType::BigInt | ValueType::BigDecimal => "::numeric",
+                ValueType::Boolean => "::boolean",
+                ValueType::Bytes => "",
+                ValueType::ID => "",
+                ValueType::Int => "::bigint",
+                ValueType::String => "",
+                ValueType::List => {
+                    return Err(QueryExecutionError::OrderByNotSupportedForType(
+                        "List".to_string(),
+                    ));
+                }
+            };
+
             query = match value_type {
                 ValueType::String => query.order(
                     sql::<Text>("left(data ->")
@@ -830,23 +955,30 @@ impl Table {
 
         let query_debug_info = debug_query(&query).to_string();
 
-        query
+        let values = query
             .load::<(serde_json::Value, String)>(conn)
             .map_err(|e| {
                 QueryExecutionError::ResolveEntitiesError(format!(
                     "{}, query = {:?}",
                     e, query_debug_info
                 ))
+            })?;
+        values
+            .into_iter()
+            .map(|(value, entity_type)| {
+                entity_from_json(value, &entity_type).map_err(QueryExecutionError::from)
             })
+            .collect()
     }
 
     fn insert(
         &self,
         conn: &PgConnection,
         key: &EntityKey,
-        data: &serde_json::Value,
+        entity: &Entity,
         history_event: Option<&HistoryEvent>,
     ) -> Result<usize, StoreError> {
+        let data = entity_to_json(key, entity)?;
         let event_source = HistoryEvent::to_event_source_string(&history_event);
 
         self.add_entity_history_record(conn, history_event, &key, OperationType::Insert)?;
@@ -891,14 +1023,64 @@ impl Table {
         &self,
         conn: &PgConnection,
         key: &EntityKey,
-        data: &serde_json::Value,
-        overwrite: bool,
-        guard: Option<EntityFilter>,
+        entity: &Entity,
         history_event: Option<&HistoryEvent>,
     ) -> Result<usize, StoreError> {
+        let data = entity_to_json(key, &entity)?;
+
         self.add_entity_history_record(conn, history_event, &key, OperationType::Update)?;
 
-        self.update_data(conn, key, data, overwrite, guard, history_event)
+        let event_source = HistoryEvent::to_event_source_string(&history_event);
+
+        // We need to use a direct query since diesel::update does not like
+        // dynamic tables.
+        let query = format!(
+            "update {}.entities
+                       set data = $3, event_source = $4
+                       where entity = $1 and id = $2",
+            self.schema
+        );
+        let query = diesel::sql_query(query)
+            .bind::<Text, _>(&key.entity_type)
+            .bind::<Text, _>(&key.entity_id)
+            .bind::<Jsonb, _>(data)
+            .bind::<Text, _>(&event_source);
+        query.execute(conn).map_err(|e| {
+            format_err!(
+                "Failed to update entity ({}, {}, {}): {}",
+                key.subgraph_id,
+                key.entity_type,
+                key.entity_id,
+                e
+            )
+            .into()
+        })
+    }
+
+    fn update_metadata(
+        &self,
+        conn: &PgConnection,
+        key: &EntityKey,
+        entity: &Entity,
+    ) -> Result<usize, StoreError> {
+        const NONE: &str = "none";
+        assert_eq!(
+            *SUBGRAPHS_ID, key.subgraph_id,
+            "update_metadata can only be called on the metadata subgraph"
+        );
+        let data = entity_to_json(key, &entity)?;
+
+        use self::subgraphs::entities;
+
+        let query = diesel::update(entities::table)
+            .filter(entities::entity.eq(&key.entity_type))
+            .filter(entities::id.eq(&key.entity_id))
+            .set((
+                entities::data.eq(entities::data.merge(&data)),
+                entities::event_source.eq(NONE),
+            ));
+
+        Ok(query.execute(conn)?)
     }
 
     fn delete(
@@ -907,15 +1089,6 @@ impl Table {
         key: &EntityKey,
         history_event: Option<&HistoryEvent>,
     ) -> Result<usize, StoreError> {
-        diesel::select(set_config(
-            "vars.current_event_source",
-            HistoryEvent::to_event_source_string(&history_event),
-            true,
-        ))
-        .execute(conn)
-        .map_err(|e| format_err!("Failed to set event source for remove operation: {}", e))
-        .map(|_| ())?;
-
         self.add_entity_history_record(conn, history_event, &key, OperationType::Delete)?;
 
         let query = format!(
@@ -928,52 +1101,6 @@ impl Table {
             .bind::<Text, _>(&key.entity_type)
             .bind::<Text, _>(&key.entity_id);
         Ok(query.execute(conn)?)
-    }
-
-    /// Adjust the `entityCount` property of the `SubgraphDeployment` for
-    /// `subgraph` by `count`. This needs to be performed after the changes
-    /// underlying `count` have been written to the store.
-    pub(crate) fn update_entity_count(
-        &self,
-        conn: &PgConnection,
-        subgraph: &SubgraphDeploymentId,
-        count: i32,
-    ) -> Result<(), StoreError> {
-        let count_query = format!("select count(*) from {}.entities", self.schema);
-        // The big complication in this query is how to determine what the
-        // new entityCount should be. We want to make sure that if the entityCount
-        // is NULL or the special value `00`, it gets recomputed. Using `00` here
-        // makes it possible to manually set the `entityCount` to that value
-        // to force a recount; setting it to `NULL` is not desirable since
-        // `entityCount` on the GraphQL level is not nullable, and so setting
-        // `entityCount` to `NULL` could cause errors at that layer; temporarily
-        // returning `0` is more palatable. To be exact, recounts have to be
-        // done here, from the subgraph writer.
-        //
-        // The first argument of `coalesce` will be `NULL` if the entity count
-        // is `NULL` or `00`, forcing `coalesce` to evaluate its second
-        // argument, the query to count entities. In all other cases,
-        // `coalesce` does not evaluate its second argument
-        let current_count = "(nullif(data->'entityCount'->>'data', '00'))::numeric";
-        let query = format!(
-            "
-            update subgraphs.entities
-            set data = data || (format('{{\"entityCount\":
-                                  {{ \"data\": \"%s\",
-                                    \"type\": \"BigInt\"}}}}',
-                                  coalesce({current_count} + $1,
-                                           ({count_query}))))::jsonb
-            where entity='SubgraphDeployment'
-              and id = $2
-            ",
-            current_count = current_count,
-            count_query = count_query
-        );
-        Ok(diesel::sql_query(query)
-            .bind::<Integer, _>(count)
-            .bind::<Text, _>(subgraph.to_string())
-            .execute(conn)
-            .map(|_| ())?)
     }
 
     fn conflicting_entity(
@@ -1008,19 +1135,20 @@ impl Table {
         // We only need to do work for the subgraph of subgraphs. All other
         // entities tables have triggers that will populate a history record
         // whenever we make a change to an entity
-        if key.subgraph_id != *SUBGRAPHS_ID {
+        if !key.subgraph_id.is_meta() {
             return Ok(());
         }
         let history_event = match history_event {
             None => return Ok(()),
             Some(event) => event,
         };
-
+        let event_id = history_event
+            .id
+            .expect("we always allocate an event_id when we need to record metadata history");
         let schema = self.schema.as_str();
 
-        if schema == SUBGRAPHS_ID.to_string() {
-            diesel::sql_query(format!(
-                "insert into {}.entity_history(
+        diesel::sql_query(format!(
+            "insert into {}.entity_history(
                    event_id,
                    subgraph, entity, entity_id,
                    data_before, op_id
@@ -1035,35 +1163,14 @@ impl Table {
                      where entity = $3
                        and id = $4) as data_before,
                    $5 as op_id",
-                schema, schema,
-            ))
-            .bind::<Integer, _>(history_event.id)
-            .bind::<Text, _>(&*history_event.subgraph)
-            .bind::<Text, _>(&key.entity_type)
-            .bind::<Text, _>(&key.entity_id)
-            .bind::<Integer, i32>(operation.into())
-            .execute(conn)?;
-        } else {
-            diesel::sql_query(format!(
-                "insert into {}.entity_history(
-                   event_id,
-                   entity, entity_id,
-                   data_before, op_id
-                 )
-                 select
-                   $1 as event_id,
-                   $2 as entity,
-                   $3 as entity_id,
-                   (select data from {}.entities where entity = $2 and id = $3) as data_before,
-                   $4 as op_id",
-                schema, schema
-            ))
-            .bind::<Integer, _>(history_event.id)
-            .bind::<Text, _>(&key.entity_type)
-            .bind::<Text, _>(&key.entity_id)
-            .bind::<Integer, i32>(operation.into())
-            .execute(conn)?;
-        }
+            schema, schema,
+        ))
+        .bind::<Integer, _>(event_id)
+        .bind::<Text, _>(&*history_event.subgraph)
+        .bind::<Text, _>(&key.entity_type)
+        .bind::<Text, _>(&key.entity_id)
+        .bind::<Integer, i32>(operation.into())
+        .execute(conn)?;
 
         Ok(())
     }
@@ -1218,7 +1325,11 @@ impl Table {
 
         for history in records.into_iter() {
             // Perform the actual reversion
-            let key = self.entity_key(history.entity.clone(), history.entity_id.clone());
+            let key = EntityKey {
+                subgraph_id: self.subgraph.clone(),
+                entity_type: history.entity.clone(),
+                entity_id: history.entity_id.clone(),
+            };
             match history.op {
                 0 => {
                     // Reverse an insert
@@ -1268,14 +1379,114 @@ impl Table {
 
         Ok((changes, count))
     }
+}
 
-    fn migrate(
-        self,
-        _conn: &PgConnection,
-        _logger: &Logger,
-        _schema: &Schema,
-    ) -> Result<Self, Error> {
-        Ok(self)
+impl Storage {
+    /// The version for newly created subgraph schemas. Changing this most
+    /// likely also requires changing `create_schema`
+    #[allow(dead_code)]
+    const DEFAULT_VERSION: public::DeploymentSchemaVersion = public::DeploymentSchemaVersion::Split;
+
+    /// Look up the schema for `subgraph` and return its entity storage.
+    /// Returns an error if `subgraph` does not have an entry in
+    /// `deployment_schemas`, which can only happen if `create_schema` was not
+    /// called for that `subgraph`
+    pub(crate) fn new(
+        conn: &PgConnection,
+        subgraph: &SubgraphDeploymentId,
+        store: &Store,
+    ) -> Result<Self, StoreError> {
+        use public::DeploymentSchemaVersion as V;
+
+        let schema = find_schema(conn, subgraph)?
+            .ok_or_else(|| StoreError::Unknown(format_err!("unknown subgraph {}", subgraph)))?;
+        let storage = match schema.version {
+            V::Split => {
+                let table =
+                    diesel_dynamic_schema::schema(schema.name.clone()).table("entities".to_owned());
+                let id = table.column::<Text, _>("id".to_string());
+                let entity = table.column::<Text, _>("entity".to_string());
+                let data = table.column::<Jsonb, _>("data".to_string());
+                let event_source = table.column::<Text, _>("event_source".to_string());
+                let count_query = format!("select count(*) from \"{}\".entities", schema.name);
+
+                Storage::Json(JsonStorage {
+                    schema: schema.name,
+                    subgraph: subgraph.clone(),
+                    table,
+                    id,
+                    entity,
+                    data,
+                    event_source,
+                    count_query,
+                })
+            }
+            V::Relational => {
+                let subgraph_schema = store.input_schema(subgraph)?;
+                let layout = Layout::new(
+                    &subgraph_schema.document,
+                    IdType::String,
+                    subgraph.clone(),
+                    schema.name,
+                )?;
+                Storage::Relational(layout)
+            }
+        };
+        Ok(storage)
+    }
+
+    /// Return `true` if it is safe to cache this storage instance across
+    /// transactions
+    pub(crate) fn is_cacheable(&self) -> bool {
+        !self.needs_migrating()
+    }
+
+    /// Adjust the `entityCount` property of the `SubgraphDeployment` for
+    /// `subgraph` by `count`. This needs to be performed after the changes
+    /// underlying `count` have been written to the store.
+    pub(crate) fn update_entity_count(
+        &self,
+        conn: &PgConnection,
+        count: i32,
+    ) -> Result<(), StoreError> {
+        let count_query = match self {
+            Storage::Json(json) => json.count_query.as_str(),
+            Storage::Relational(layout) => layout.count_query.as_str(),
+        };
+        // The big complication in this query is how to determine what the
+        // new entityCount should be. We want to make sure that if the entityCount
+        // is NULL or the special value `00`, it gets recomputed. Using `00` here
+        // makes it possible to manually set the `entityCount` to that value
+        // to force a recount; setting it to `NULL` is not desirable since
+        // `entityCount` on the GraphQL level is not nullable, and so setting
+        // `entityCount` to `NULL` could cause errors at that layer; temporarily
+        // returning `0` is more palatable. To be exact, recounts have to be
+        // done here, from the subgraph writer.
+        //
+        // The first argument of `coalesce` will be `NULL` if the entity count
+        // is `NULL` or `00`, forcing `coalesce` to evaluate its second
+        // argument, the query to count entities. In all other cases,
+        // `coalesce` does not evaluate its second argument
+        let current_count = "(nullif(data->'entityCount'->>'data', '00'))::numeric";
+        let query = format!(
+            "
+            update subgraphs.entities
+            set data = data || (format('{{\"entityCount\":
+                                  {{ \"data\": \"%s\",
+                                    \"type\": \"BigInt\"}}}}',
+                                  coalesce({current_count} + $1,
+                                           ({count_query}))))::jsonb
+            where entity='SubgraphDeployment'
+              and id = $2
+            ",
+            current_count = current_count,
+            count_query = count_query
+        );
+        Ok(diesel::sql_query(query)
+            .bind::<Integer, _>(count)
+            .bind::<Text, _>(self.subgraph().to_string())
+            .execute(conn)
+            .map(|_| ())?)
     }
 
     fn needs_migrating(&self) -> bool {
@@ -1286,7 +1497,11 @@ impl Table {
 /// Delete all entities. This function exists solely for integration tests
 /// and should never be called from any other code. Unfortunately, Rust makes
 /// it very hard to export items just for testing
-pub fn delete_all_entities_for_test_use_only(conn: &PgConnection) -> Result<usize, StoreError> {
+#[cfg(debug_assertions)]
+pub fn delete_all_entities_for_test_use_only(
+    store: &Store,
+    conn: &PgConnection,
+) -> Result<usize, StoreError> {
     // Delete public entities and related data
     let mut rows = diesel::delete(public::event_meta_data::table).execute(conn)?;
     // Delete all subgraph schemas
@@ -1301,48 +1516,11 @@ pub fn delete_all_entities_for_test_use_only(conn: &PgConnection) -> Result<usiz
     }
     // Delete subgraphs entities
     rows = rows + diesel::delete(subgraphs::entities::table).execute(conn)?;
+    store.storage_cache.lock().unwrap().clear();
     Ok(rows)
 }
 
-/// Create the database schema for a new subgraph, including a table for the
-/// entities and a table for entity history, plus the triggers needed to
-/// record history.
-///
-/// It is an error if `deployment_schemas` already has an entry for this
-/// `subgraph_id`
-pub(crate) fn create_schema(
-    conn: &PgConnection,
-    subgraph_id: &SubgraphDeploymentId,
-) -> Result<(), StoreError> {
-    // Check if there already is an entry for this subgraph. If so, do
-    // nothing
-    let count = deployment_schemas::table
-        .filter(deployment_schemas::subgraph.eq(subgraph_id.to_string()))
-        .count()
-        .first::<i64>(conn)?;
-    if count > 0 {
-        return Ok(());
-    }
-
-    // Create a schema for the deployment.
-    let schemas: Vec<String> = diesel::insert_into(deployment_schemas::table)
-        .values((
-            deployment_schemas::subgraph.eq(subgraph_id.to_string()),
-            deployment_schemas::version.eq(Table::DEFAULT_VERSION),
-        ))
-        .returning(deployment_schemas::name)
-        .get_results(conn)?;
-    let schema_name = schemas
-        .first()
-        .ok_or_else(|| format_err!("failed to read schema name for {} back", subgraph_id))?;
-
-    // Note that we have to use conn.batch_execute to issue DDL commands; using
-    // diesel::sql_query(..).execute(conn) can lead to cases where the command
-    // is sent to the database, and shows up in the database logs, but has no
-    // effect at all, but also does not result in an error.
-    let query = format!("create schema {}", schema_name);
-    conn.batch_execute(&*query)?;
-
+pub fn create_split_schema(conn: &PgConnection, schema_name: &str) -> Result<(), StoreError> {
     // The order of columns in the primary key matters a lot, since
     // we want the pk index to also support queries that do not have an id,
     // just an entity (like counting the number of entities of a certain type)
@@ -1392,8 +1570,7 @@ pub(crate) fn create_schema(
         "create table {}.entity_history
          (
            id           serial primary key,
-           event_id     integer references event_meta_data(id)
-                          on update cascade on delete cascade,
+           event_id     integer,
            entity       varchar not null,
            entity_id    varchar not null,
            data_before  jsonb,
@@ -1417,7 +1594,8 @@ pub(crate) fn create_schema(
 /// Drop the schema for `subgraph`. This deletes all data for the subgraph,
 /// and can not be reversed. It does not remove any of the metadata in
 /// `subgraphs.entities` associated with the subgraph
-pub(crate) fn drop_schema(
+#[cfg(debug_assertions)]
+fn drop_schema(
     conn: &diesel::pg::PgConnection,
     subgraph: &SubgraphDeploymentId,
 ) -> Result<usize, StoreError> {
@@ -1431,38 +1609,4 @@ pub(crate) fn drop_schema(
     } else {
         Ok(0)
     }
-}
-
-/// Ensures a history event exists for the current transaction and returns its ID.
-fn create_history_event(
-    conn: &diesel::pg::PgConnection,
-    subgraph: SubgraphDeploymentId,
-    event_source: EventSource,
-) -> Result<HistoryEvent, Error> {
-    #[derive(Queryable, Debug)]
-    struct Event {
-        id: i32,
-    };
-
-    impl QueryableByName<Pg> for Event {
-        fn build<R: diesel::row::NamedRow<Pg>>(row: &R) -> diesel::deserialize::Result<Self> {
-            Ok(Event {
-                id: row.get("event_id")?,
-            })
-        }
-    }
-
-    let result: Event = diesel::sql_query(
-        "insert into event_meta_data (db_transaction_id, db_transaction_time, source)
-           values (txid_current(), statement_timestamp(), $1)
-         returning event_meta_data.id as event_id",
-    )
-    .bind::<Text, _>(event_source.to_string())
-    .get_result(conn)?;
-
-    Ok(HistoryEvent {
-        id: result.id,
-        subgraph,
-        source: event_source,
-    })
 }

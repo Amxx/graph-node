@@ -5,7 +5,7 @@ use crate::prelude::*;
 use crate::schema::ast::get_named_type;
 use graph::prelude::{QueryExecutionError, StoreEventStreamBox};
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum ObjectOrInterface<'a> {
     Object(&'a s::ObjectType),
     Interface(&'a s::InterfaceType),
@@ -57,6 +57,7 @@ pub trait Resolver: Clone + Send + Sync {
         object_type: ObjectOrInterface<'_>,
         arguments: &HashMap<&q::Name, q::Value>,
         types_for_interface: &BTreeMap<Name, Vec<ObjectType>>,
+        max_first: u32,
     ) -> Result<q::Value, QueryExecutionError>;
 
     /// Resolves an entity referenced by a parent object.

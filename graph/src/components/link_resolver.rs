@@ -1,6 +1,7 @@
 use failure;
 use serde_json::Value;
 use slog::Logger;
+use std::time::Duration;
 use tokio::prelude::*;
 
 use crate::data::subgraph::Link;
@@ -17,7 +18,17 @@ pub type JsonValueStream =
     Box<dyn Stream<Item = JsonStreamValue, Error = failure::Error> + Send + 'static>;
 
 /// Resolves links to subgraph manifests and resources referenced by them.
-pub trait LinkResolver: Send + Sync + 'static + Sized {
+pub trait LinkResolver: Send + Sync + 'static {
+    /// Updates the timeout used by the resolver.
+    fn with_timeout(self, timeout: Duration) -> Self
+    where
+        Self: Sized;
+
+    /// Enables infinite retries.
+    fn with_retries(self) -> Self
+    where
+        Self: Sized;
+
     /// Fetches the link contents as bytes.
     fn cat(
         &self,
