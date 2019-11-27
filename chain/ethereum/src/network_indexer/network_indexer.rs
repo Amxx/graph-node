@@ -227,6 +227,12 @@ fn fetch_new_blocks(
                 }
 
                 Ok(Some(_)) => {
+                    trace!(
+                        logger,
+                        "Found the common ancestor";
+                        "block" => format!("#{} ({:x})", number, hash),
+                    );
+
                     // We have the block already, so this is the block after which
                     // the chain was forked
                     Box::new(future::ok(Loop::Break(blocks)))
@@ -259,13 +265,6 @@ fn collect_blocks_to_revert(
     head: EthereumBlockPointer,
     common_ancestor: EthereumBlockPointer,
 ) -> CollectBlocksToRevertFuture {
-    trace!(
-        logger,
-        "Collect old blocks";
-        "common_ancestor" => format_block_pointer(&common_ancestor),
-        "head" => format_block_pointer(&head),
-    );
-
     Box::new(loop_fn(vec![head], move |mut blocks| {
         let logger = logger.clone();
         let store = store.clone();
@@ -275,6 +274,13 @@ fn collect_blocks_to_revert(
         let block_ptr_for_missing_parent = block_ptr.clone();
         let block_ptr_for_invalid_parent = block_ptr.clone();
 
+        trace!(
+            logger,
+            "Collect old block";
+            "common_ancestor" => format_block_pointer(&common_ancestor),
+            "block" => format_block_pointer(&block_ptr),
+        );
+
         // If we've reached the common ancestor, terminate the loop and return
         // the blocks we have collected up to here
         if block_ptr == common_ancestor {
@@ -283,13 +289,6 @@ fn collect_blocks_to_revert(
             return Box::new(future::ok(Loop::Break(blocks)))
                 as Box<dyn Future<Item = _, Error = _> + Send>;
         }
-
-        trace!(
-            logger,
-            "Collect old block";
-            "common_ancestor" => format_block_pointer(&common_ancestor),
-            "block" => format_block_pointer(&block_ptr),
-        );
 
         // Look this block up from the store
         Box::new(
@@ -752,6 +751,27 @@ impl PollStateMachine for StateMachine {
                         String::from("none"), |ptr| format_block_pointer(&ptr)
                     ),
                 );
+
+                // If we're already at the chain head, keep polling it.
+                if Some((&chain_head).into()) == state.local_head {
+                    debug!(
+                        context.logger,
+                        "Already at chain head; poll chain head again";
+                        "chain_head" => format_light_block(&chain_head),
+                        "local_head" => state.local_head.map_or(
+                            String::from("none"), |ptr| format_block_pointer(&ptr)
+                        ),
+                    );
+
+                    // Chain head was invalid, try getting a better one.
+                    transition!(PollChainHead {
+                        local_head: state.local_head,
+                        chain_head: poll_chain_head(
+                            context.logger.clone(),
+                            context.adapter.clone()
+                        ),
+                    });
+                }
 
                 // Calculate the number of blocks remaining before we are in sync with the
                 // network; fetch no more than 1000 blocks at a time.
